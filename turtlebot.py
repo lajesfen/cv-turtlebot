@@ -1,6 +1,7 @@
 import socket
 import base64
 import struct
+import time
 
 import numpy as np
 import cv2
@@ -23,6 +24,9 @@ ANG = 3.00     # rad/s
 
 detector = cv2.QRCodeDetector()
 control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+turning = False
+ROTATION_90_TIME = (np.pi / 2) / ANG  # tiempo aproximado para girar 90 grados
 
 def send_packet(v: float, w: float):
     control_sock.sendto(struct.pack("ff", float(v), float(w)), (ROBOT_IP, CONTROL_PORT))
@@ -131,6 +135,8 @@ def handle_img(parts):
     IMG <domain_id> <robot_name> <sec> <nsec> <base64_jpeg>
     Como base64 puede tener espacios si algo raro pasa, juntamos desde índice 5.
     """
+    global turning
+
     if len(parts) < 6:
         print("[IMG] Mensaje demasiado corto.")
         return
@@ -156,6 +162,22 @@ def handle_img(parts):
 
         if qr_data:
             print(f"[IMG] QR detectado: '{qr_data}'")
+
+        # Test: Moverse y girar si se detecta un QR
+        if qr_data and not turning:
+            turning = True
+
+            if qr_data == "TURN_RIGHT":
+                turn_right()
+                time.sleep(ROTATION_90_TIME)
+                move_forward()
+
+            if qr_data == "TURN_LEFT":
+                turn_left()
+                time.sleep(ROTATION_90_TIME)
+                move_forward()
+            
+            turning = False
 
         # Mostrar con OpenCV
         cv2.imshow(f"Camara {robot_name} (domain {domain_id})", img)
