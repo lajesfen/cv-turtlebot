@@ -181,12 +181,16 @@ def handle_img(parts):
                 turning = True
  
         if qr_data and not already_turning:
-            if qr_data == "TURN_RIGHT":
+            if qr_data == "milestone_phi":
                 t = threading.Thread(target=execute_turn, args=("RIGHT",), daemon=True)
                 t.start()
-            elif qr_data == "TURN_LEFT":
+            elif qr_data == "milestone_rho":
                 t = threading.Thread(target=execute_turn, args=("LEFT",), daemon=True)
                 t.start()
+            elif qr_data == "milestone_omega":
+                move_forward()
+            elif qr_data == "milestone_gamma":
+                stop()
             else:
                 with turning_lock:
                     turning = False
