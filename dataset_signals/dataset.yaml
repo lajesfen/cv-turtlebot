@@ -1,0 +1,7 @@
+path: "/Users/luislopezchambi/Documents/UTEC/Visio\u0301n/cv-turtlebot/dataset_signals"
+train: images/train
+val: images/val
+names:
+  0: turn_left
+  1: turn_right
+  2: stop

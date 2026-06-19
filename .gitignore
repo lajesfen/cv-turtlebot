@@ -1,2 +1,23 @@
 .DS_Store
-.venv
+
+# Python virtual environments
+.venv/
+.venv-training/
+venv/
+env/
+
+# Model / training artifacts
+signs_model/
+dataset_signals/
+*.pt
+*.bin
+*.onnx
+
+# Large dependency caches / build outputs
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+
+# Local notebooks / logs
+*.log

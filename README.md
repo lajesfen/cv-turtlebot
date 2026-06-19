@@ -1,246 +1,274 @@
-# 🧠 TurtleBot 4 – Setup Completo (VM + Robot físico)
+# CV TurtleBot
 
-**Versión de Ubuntu:** [Ubuntu 24.04 LTS (Noble)](https://releases.ubuntu.com/24.04)  
-**Máquina virtual:** [VirtualBox](https://www.virtualbox.org)  
-**ROS 2:** [Jazzy Jalisco](https://docs.ros.org/en/jazzy/)  
-**Robot:** TurtleBot 4 Lite  
-**Manual oficial:** [TurtleBot 4 User Manual – Basic Setup](https://turtlebot.github.io/turtlebot4-user-manual/setup/basic.html)
+Proyecto experimental para controlar un TurtleBot 4 desde una computadora y
+procesar la cámara y el LiDAR. Incluye dos clientes de control por UDP y un
+script para entrenar un detector de señales con Ultralytics YOLO.
 
----
+> [!IMPORTANT]
+> Este repositorio contiene únicamente el software del lado de la computadora.
+> Falta el nodo o servidor que debe ejecutarse en el TurtleBot para publicar la
+> telemetría y recibir comandos en los puertos UDP `6000` y `5007`. Por ese
+> motivo, el proyecto todavía no funciona de extremo a extremo por sí solo.
 
-## 🧩 Índice
-1. Crear la máquina virtual con Ubuntu 24.04
-2. Preparar Ubuntu para ROS 2 Jazzy
-3. Instalar ROS 2 Jazzy
-4. Instalar paquetes del TurtleBot 4
-5. Configurar y conectar al TurtleBot 4
-6. Verificación de comunicación (talker/listener)
-7. Instalación de sensores y bringup
-8. Pruebas de movimiento y cámara/LiDAR
-9. Notas, tips y solución de errores
+## Estructura del proyecto
 
----
+```text
+cv-turtlebot/
+├── README.md
+├── .gitignore
+├── turtlebot.py
+├── turtlebot_autonomous.py
+├── train_signs.py
+└── sample_images/
+    └── output_*.png
+```
 
-## 1️⃣ Crear máquina virtual con Ubuntu 24.04
+### `README.md`
 
-1. Instala **VirtualBox**.
-2. Crea una nueva VM:
-   - **Tipo:** Linux → Ubuntu (64-bit)
-   - **RAM:** mínimo 4 GB (recomendado 8 GB)
-   - **Disco:** 20 GB +
-   - **ISO:** adjunta Ubuntu 24.04.
-3. Instala Ubuntu normalmente.
-4. Instala las **Guest Additions** (para mejor resolución y clipboard).
-5. Actualiza el sistema:
-   ```bash
-   sudo apt update
-   sudo apt upgrade -y
-   sudo reboot
+Es este documento. Describe el contenido del repositorio, cómo se relacionan
+sus componentes y qué hace falta antes de conectarlo a un robot físico.
+
+### `.gitignore`
+
+Evita que Git agregue archivos locales que no deben formar parte del proyecto:
+
+- `.DS_Store`: metadatos creados por macOS.
+- `.venv`: entorno virtual local de Python.
+
+Actualmente no excluye datasets, resultados de entrenamiento ni pesos de
+modelos. Conviene agregarlos si son grandes y no se almacenarán en Git.
+
+### `turtlebot.py`
+
+Cliente manual basado en Python, OpenCV y sockets UDP. No utiliza directamente
+la API de ROS 2.
+
+Sus responsabilidades son:
+
+1. Contactar al servidor del robot en `ROBOT_IP:6000`.
+2. Enviar el mensaje de emparejamiento:
+
+   ```text
+   HELLO <domain_id> <pairing_code>
    ```
 
----
+3. Esperar una respuesta con este formato:
 
-## 2️⃣ Preparar Ubuntu para ROS 2 Jazzy
-
-```bash
-# Asegurar entorno UTF-8
-sudo apt install locales -y
-sudo locale-gen en_US en_US.UTF-8
-sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-export LANG=en_US.UTF-8
-
-# Habilitar repositorios
-sudo apt install software-properties-common -y
-sudo add-apt-repository universe
-
-# Añadir repositorio de ROS
-sudo apt install curl gnupg2 lsb-release -y
-sudo mkdir -p /usr/share/keyrings
-curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key   | sudo gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg
-
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
-
-sudo apt update
-```
-
----
-
-## 3️⃣ Instalar ROS 2 Jazzy
-
-```bash
-sudo apt install ros-jazzy-desktop -y
-echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
-source ~/.bashrc
-```
-
-Verifica que ROS 2 funciona:
-```bash
-ros2 run demo_nodes_cpp talker
-```
-
----
-
-## 4️⃣ Instalar paquetes específicos del TurtleBot 4
-
-```bash
-sudo apt update
-sudo apt install ros-jazzy-turtlebot4-desktop -y
-```
-
-Verifica que esté instalado:
-```bash
-ros2 pkg list | grep turtlebot4
-```
-
----
-
-## 5️⃣ Configurar y conectar al TurtleBot 4
-
-1. **Encender el robot**.
-2. Conéctate a su red Wi-Fi:
-   - **SSID:** `turtlebot4`
-   - **Contraseña:** `turtlebot4`
-3. Accede por SSH:
-   ```bash
-   ssh ubuntu@10.42.0.1
-   # contraseña: turtlebot4
-   ```
-4. Ejecuta el asistente de configuración:
-   ```bash
-   turtlebot4-setup
-   ```
-   Completa los parámetros de Wi-Fi:
-   ```
-   SSID: Lab_Computech_5G
-   Password: Computech2025!
-   ```
-5. Luego abre en un navegador:
-   ```
-   http://<ip-del-turtlebot>:8080
-   ```
-   En la interfaz web, configura la red del **Create 3**.
-
-6. Reinicia el robot:
-   ```bash
-   sudo reboot
+   ```text
+   ACK <domain_id> <robot_name>
    ```
 
----
+4. Recibir mediciones del LiDAR como mensajes de texto `SCAN`.
+5. Recibir imágenes JPEG codificadas en Base64 como mensajes `IMG`.
+6. Detectar códigos QR con `cv2.QRCodeDetector`.
+7. Enviar velocidades lineales y angulares al puerto UDP `5007`.
 
-## 6️⃣ Verificación de comunicación (listener ↔ talker)
+Los códigos QR reconocidos son:
 
-### En el **robot**:
+- `TURN_LEFT`: gira aproximadamente 90 grados a la izquierda.
+- `TURN_RIGHT`: gira aproximadamente 90 grados a la derecha.
+
+El giro se calcula por tiempo, no con odometría. Por ello, el ángulo real puede
+variar según la batería, el piso y la respuesta del robot.
+
+Configuración que debe revisarse antes de ejecutarlo:
+
+```python
+ROBOT_IP = "192.168.0.101"
+ROBOT_PORT = 6000
+CONTROL_PORT = 5007
+DESIRED_DOMAIN_ID = 67
+PAIRING_CODE = "oscar"
+EXPECTED_ROBOT_NAME = "turtlebotoscar"
+```
+
+### `turtlebot_autonomous.py`
+
+Cliente de conducción autónoma. Reutiliza el mismo protocolo UDP de
+`turtlebot.py`, pero reemplaza los códigos QR por detección de señales con un
+modelo YOLO.
+
+El programa ejecuta tres tareas principales:
+
+- Recepción de imágenes y mediciones del LiDAR.
+- Detección de `turn_left`, `turn_right` y `stop` con YOLO.
+- Movimiento hacia adelante con un controlador proporcional para intentar
+  mantener el robot centrado entre dos paredes.
+
+El controlador compara dos posiciones del arreglo del LiDAR:
+
+```python
+LIDAR_LEFT_IDX = 90
+LIDAR_RIGHT_IDX = 270
+```
+
+Estos índices sólo son correctos si la orientación y cantidad de mediciones del
+LiDAR coinciden con lo asumido por el programa. Deben validarse con datos reales.
+
+El modelo se carga desde:
+
+```text
+signs_model/weights/best.pt
+```
+
+Ese archivo no está incluido en el repositorio. Además, antes de usar este modo
+en un robot físico deben implementarse como mínimo:
+
+- Detención ante obstáculos frontales.
+- Detención si dejan de llegar datos del LiDAR o de la red.
+- Límite y validación de velocidades.
+- Confirmación de comandos y un mecanismo de parada de emergencia.
+- Control de giro mediante odometría en lugar de temporización.
+
+### `train_signs.py`
+
+Entrena un modelo YOLO para reconocer señales de giro y parada.
+
+Las clases configuradas son:
+
+```text
+0: turn_left
+1: turn_right
+2: stop
+```
+
+El script espera esta estructura, que todavía no está incluida:
+
+```text
+dataset/
+├── images/
+│   ├── train/
+│   └── val/
+└── labels/
+    ├── train/
+    └── val/
+```
+
+Cada imagen necesita un archivo `.txt` con anotaciones en formato YOLO:
+
+```text
+<class_id> <x_center> <y_center> <width> <height>
+```
+
+Todos los valores de posición y tamaño deben estar normalizados entre `0` y
+`1`. El entrenamiento usa 60 épocas, imágenes de `416 x 416` y un batch de 16.
+
+El código inicia el entrenamiento con:
+
+```python
+YOLO("yolo26n.pt")
+```
+
+Los resultados se generan dentro de `signs_model/`. Con la configuración
+actual, el mejor peso puede quedar en:
+
+```text
+signs_model/weights/weights/best.pt
+```
+
+Si esto ocurre, se debe mover el archivo o corregir `YOLO_MODEL_PATH` en
+`turtlebot_autonomous.py`.
+
+### `sample_images/`
+
+Contiene doce imágenes PNG de muestra. No son consumidas automáticamente por
+ninguno de los scripts actuales; sirven como evidencia visual, pruebas manuales
+o material inicial para preparar un dataset.
+
+Para utilizarlas en el entrenamiento es necesario:
+
+1. Separarlas entre `dataset/images/train` y `dataset/images/val`.
+2. Dibujar las cajas de cada señal.
+3. Crear los archivos de etiquetas correspondientes.
+
+## Flujo de comunicación esperado
+
+```text
+TurtleBot 4                              Laptop
+┌──────────────────────────────┐          ┌──────────────────────────────┐
+│ Servidor UDP no incluido     │          │ turtlebot.py                 │
+│                              │  IMG --> │ o                           │
+│ ROS 2 -> cámara y LiDAR      │ SCAN --> │ turtlebot_autonomous.py      │
+│                              │ <-- v,w │                              │
+│ UDP 6000 / UDP 5007          │          │ OpenCV / NumPy / YOLO        │
+└──────────────────────────────┘          └──────────────────────────────┘
+```
+
+`ROS_DOMAIN_ID` aparece en el protocolo de emparejamiento, pero los clientes no
+participan en DDS ni crean nodos ROS 2. El servidor faltante es quien tendría que
+suscribirse y publicar en los tópicos reales del TurtleBot.
+
+## Requisitos de Python
+
+Para `turtlebot.py`:
+
+```text
+numpy
+opencv-python
+```
+
+Para `turtlebot_autonomous.py` y `train_signs.py` también se requiere:
+
+```text
+ultralytics
+PyYAML
+```
+
+Instalación local en macOS o Ubuntu:
+
 ```bash
-sudo apt update
-sudo mkdir -p /usr/share/keyrings
-sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key   | sudo gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
-sudo apt update
-sudo apt install -y ros-$ROS_DISTRO-demo-nodes-cpp ros-$ROS_DISTRO-demo-nodes-py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install numpy opencv-python ultralytics PyYAML
 ```
 
-### En el **robot (terminal 1)**:
-```bash
-ros2 run demo_nodes_cpp listener
-```
+## Ejecución
 
-### En la **VM (terminal 2)**:
-```bash
-ros2 run demo_nodes_cpp talker
-```
+Antes de ejecutar cualquier cliente deben cumplirse estas condiciones:
 
-✅ Si se ven los mensajes transmitidos, la comunicación ROS está funcionando correctamente.  
-❌ Si no, revisar el `ROS_DOMAIN_ID` o llamar a **Cortijo** 😎
+- La laptop y el TurtleBot están en la misma red.
+- `ROBOT_IP` contiene la IP actual de la Raspberry Pi del robot.
+- El servidor UDP faltante está instalado y activo en el robot.
+- Los puertos UDP `6000` y `5007` no están bloqueados.
+- El dominio, código de emparejamiento y nombre coinciden en ambos lados.
 
----
-
-## 7️⃣ Instalación de sensores y bringup
-
-En el **robot**, instala los paquetes esenciales:
+Cliente con códigos QR:
 
 ```bash
-sudo apt install -y   ros-jazzy-rplidar-ros   ros-jazzy-depthai-ros   ros-jazzy-irobot-create-nodes   ros-jazzy-turtlebot4-msgs   ros-jazzy-turtlebot4-description   ros-jazzy-turtlebot4-bringup
+source .venv/bin/activate
+python turtlebot.py
 ```
 
-Apaga y vuelve a encender el TurtleBot.
-
-Luego de reconectarte por SSH:
+Entrenamiento:
 
 ```bash
-ros2 launch turtlebot4_bringup lite.launch.py
+source .venv/bin/activate
+python train_signs.py
 ```
 
-Deberías ver al ejecutar:
+Cliente autónomo, sólo después de generar y configurar los pesos:
+
 ```bash
-ros2 topic list
-```
-Una lista extensa que incluya:
-```
-/battery_state
-/cmd_vel
-/odom
-/scan
-/oakd/rgb/preview/image_raw
-/tf
-...
+source .venv/bin/activate
+python turtlebot_autonomous.py
 ```
 
-Si no aparece, llamar a Cortijo.
+## Estado actual
 
----
+- [x] Cliente de cámara y LiDAR por UDP.
+- [x] Lectura de códigos QR.
+- [x] Entrenamiento y detección con YOLO.
+- [x] Control proporcional básico entre paredes.
+- [ ] Servidor ROS 2/UDP para el TurtleBot.
+- [ ] Archivo reproducible de dependencias.
+- [ ] Configuración mediante variables de entorno o argumentos.
+- [ ] Dataset y pesos entrenados.
+- [ ] Pruebas automatizadas.
+- [ ] Mecanismos de seguridad para el robot físico.
 
-## 8️⃣ Pruebas de movimiento y sensores
+## Advertencia de seguridad
 
-### 🧭 Movimiento manual
-En el **TurtleBot**:
-```bash
-ros2 topic echo /cmd_vel
-```
-
-En la **VM**:
-```bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p stamped:=true
-```
-
-### 📷 Ver la cámara
-```bash
-ros2 run rqt_image_view rqt_image_view
-```
-
-### 🌐 Activar sensores individualmente
-- **LiDAR:**
-  ```bash
-  ros2 launch turtlebot4_bringup rplidar.launch.py
-  ```
-- **Cámara OAK-D:**
-  ```bash
-  ros2 launch turtlebot4_bringup oakd.launch.py
-  ```
-
-✅ Si escuchas el sonido alegre del robot (“pu puru pupu 🎵”), el bringup se cargó correctamente.
-
----
-
-## 9️⃣ Notas y solución de errores
-
-- **Cambiar o revisar el dominio ROS:**
-  ```bash
-  echo $ROS_DOMAIN_ID
-  export ROS_DOMAIN_ID=4   # valor entre 0 y 255
-  ```
-  Usa el mismo valor en la VM y el TurtleBot.
-
-- **Actualizar variables de entorno:**
-  ```bash
-  source /opt/ros/jazzy/setup.bash
-  ```
-
-- **Verificar comunicación:**
-  ```bash
-  ros2 topic list
-  ```
-
-- **Si algo falla:**
-  - Reinicia el Create 3 (`turtlebot4-setup`, aplicar red, reboot).
-  - Revisa conexión Wi-Fi y ping entre VM ↔ TurtleBot.
-  - Si nada resulta: **llamar a Cortijo** 😄
+Prueba primero con el robot elevado, las ruedas sin contacto con el suelo y una
+persona preparada para cortar la alimentación. El modo autónomo actual es un
+prototipo y no debe operar sin supervisión.
