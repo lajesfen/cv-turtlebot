@@ -22,36 +22,59 @@ LIN = 0.90     # m/s
 ANG = 3.00     # rad/s
 
 ROTATION_90_TIME = (np.pi / 2) / ANG  # tiempo aproximado para girar 90 grados
+CONTROL_HZ = 20.0
+CONTROL_PERIOD = 1.0 / CONTROL_HZ
 
 # ========= Variables Globales =========
 
 control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-control_lock = threading.Lock()
- 
-turning = False
-turning_lock = threading.Lock()
- 
 stop_event = threading.Event()
- 
 detector = cv2.QRCodeDetector()
- 
 
-turning = False
+state_lock = threading.Lock()
+state = "STOPPED"          # STOPPED, FORWARD, TURN_LEFT, TURN_RIGHT
+turn_deadline = None
 
 # ========= Helper Functions =========
 
 def send_packet(v: float, w: float):
-    with control_lock:
-        control_sock.sendto(
-            struct.pack("ff", float(v), float(w)),
-            (ROBOT_IP, CONTROL_PORT),
-        )
+    control_sock.sendto(
+        struct.pack("ff", float(v), float(w)),
+        (ROBOT_IP, CONTROL_PORT),
+    )
 
-def move_forward():  send_packet(+LIN, 0.0)
-def move_backward(): send_packet(-LIN, 0.0)
-def turn_left():     send_packet(0.0, +ANG)
-def turn_right():    send_packet(0.0, -ANG)
-def stop():          send_packet(0.0, 0.0)
+def set_state(new_state: str):
+    global state, turn_deadline
+    with state_lock:
+        state = new_state
+        if new_state in ("TURN_LEFT", "TURN_RIGHT"):
+            turn_deadline = time.monotonic() + ROTATION_90_TIME
+        else:
+            turn_deadline = None
+
+def control_loop():
+    print("[CTRL] Hilo de control iniciado.")
+    while not stop_event.is_set():
+        with state_lock:
+            current_state = state
+            deadline = turn_deadline
+
+        if current_state in ("TURN_LEFT", "TURN_RIGHT") and deadline is not None and time.monotonic() >= deadline:
+            set_state("STOPPED")
+            with state_lock:
+                current_state = state
+
+        if current_state == "FORWARD":
+            send_packet(+LIN, 0.0)
+        elif current_state == "TURN_LEFT":
+            send_packet(0.0, +ANG)
+        elif current_state == "TURN_RIGHT":
+            send_packet(0.0, -ANG)
+        else:
+            send_packet(0.0, 0.0)
+
+        time.sleep(CONTROL_PERIOD)
+    print("[CTRL] Hilo de control terminado.")
 
 def do_handshake(sock: socket.socket, robot_addr):
     sock.settimeout(1.0)
@@ -64,34 +87,34 @@ def do_handshake(sock: socket.socket, robot_addr):
             data, addr = sock.recvfrom(4096)
             text = data.decode("utf-8").strip()
             parts = text.split()
- 
+
             if len(parts) >= 3 and parts[0] == "ACK":
                 domain_str = parts[1]
                 robot_name = " ".join(parts[2:])
                 print(f"[HANDSHAKE] Recibido: '{text}' desde {addr}")
- 
+
                 try:
                     domain_id = int(domain_str)
                 except ValueError:
                     print("[HANDSHAKE] domain_id inválido, reintentando...")
                     continue
- 
+
                 if domain_id != DESIRED_DOMAIN_ID:
                     print(f"[HANDSHAKE] ROS_DOMAIN_ID no coincide "
                           f"(esperado={DESIRED_DOMAIN_ID}, recibido={domain_id}). Reintentando...")
                     continue
- 
+
                 if robot_name != EXPECTED_ROBOT_NAME:
                     print(f"[HANDSHAKE] robot_name no coincide "
                           f"(esperado={EXPECTED_ROBOT_NAME}, recibido={robot_name}). Reintentando...")
                     continue
- 
+
                 print(f"[HANDSHAKE] Emparejado con '{robot_name}' (domain {domain_id}).")
-                sock.settimeout(None)  # sin timeout para recibir telemetría
+                sock.settimeout(None)
                 return
             else:
                 print(f"[HANDSHAKE] Mensaje inesperado: '{text}', reintentando...")
- 
+
         except socket.timeout:
             print("[HANDSHAKE] Timeout esperando ACK, reintentando...")
 
@@ -128,31 +151,11 @@ def handle_scan(parts):
     except ValueError as e:
         print(f"[SCAN] Error parseando mensaje: {e}")
 
-def execute_turn(direction: str):
-    try:
-        if direction == "RIGHT":
-            turn_right()
-        else:
-            turn_left()
-        time.sleep(ROTATION_90_TIME)
-        stop()
-    finally:
-        with turning_lock:
-            global turning
-            turning = False
-
 def handle_img(parts):
-    """
-    parts: lista de strings del mensaje:
-    IMG <domain_id> <robot_name> <sec> <nsec> <base64_jpeg>
-    Como base64 puede tener espacios si algo raro pasa, juntamos desde índice 5.
-    """
-    global turning
-
     if len(parts) < 6:
         print("[IMG] Mensaje demasiado corto.")
         return
-    
+
     try:
         domain_id = int(parts[1])
         robot_name = parts[2]
@@ -174,28 +177,19 @@ def handle_img(parts):
         if qr_data:
             print(f"[IMG] QR detectado: '{qr_data}'")
 
-        # Test: Moverse y girar si se detecta un QR
-        with turning_lock:
-            already_turning = turning
-            if qr_data and not already_turning:
-                turning = True
- 
-        if qr_data and not already_turning:
+        with state_lock:
+            currently_turning = state in ("TURN_LEFT", "TURN_RIGHT")
+
+        if qr_data and not currently_turning:
             if qr_data == "milestone_phi":
-                t = threading.Thread(target=execute_turn, args=("RIGHT",), daemon=True)
-                t.start()
+                set_state("TURN_RIGHT")
             elif qr_data == "milestone_rho":
-                t = threading.Thread(target=execute_turn, args=("LEFT",), daemon=True)
-                t.start()
-            elif qr_data == "milestone_omega":
-                move_forward()
+                set_state("TURN_LEFT")
+            elif qr_data == "milestone_beta":
+                set_state("FORWARD")
             elif qr_data == "milestone_gamma":
-                stop()
-            else:
-                with turning_lock:
-                    turning = False
- 
-        # Mostrar con OpenCV
+                set_state("STOPPED")
+
         cv2.imshow(f"Camara {robot_name} (domain {domain_id})", img)
         cv2.waitKey(1)
 
@@ -203,27 +197,28 @@ def handle_img(parts):
         print(f"[IMG] Error manejando imagen: {e}")
 
 def receive_loop(sock: socket.socket):
-    print("[RX] Hilo de recepción iniciado.")
+    print("[RCV] Hilo de recepción iniciado.")
     while not stop_event.is_set():
         try:
             data, addr = sock.recvfrom(65535)
         except OSError:
             break
- 
+
         text  = data.decode("utf-8", errors="ignore")
         parts = text.split()
         if not parts:
             continue
- 
+
         msg_type = parts[0]
         if msg_type == "SCAN":
-            handle_scan(parts)
+            # handle_scan(parts)
+            pass
         elif msg_type == "IMG":
             handle_img(parts)
         else:
-            print(f"[RX] Mensaje desconocido desde {addr}: '{msg_type}'")
- 
-    print("[RX] Hilo de recepción terminado.")
+            print(f"[RCV] Mensaje desconocido desde {addr}: '{msg_type}'")
+
+    print("[RCV] Hilo de recepción terminado.")
 
 # ========= Main =========
 
@@ -238,8 +233,11 @@ def main():
     # 1) Handshake
     do_handshake(sock, robot_addr)
 
-    rx_thread = threading.Thread(target=receive_loop, args=(sock,), daemon=True)
-    rx_thread.start()
+    ctrl_thread = threading.Thread(target=control_loop, daemon=True)
+    ctrl_thread.start()
+
+    rcv_thread = threading.Thread(target=receive_loop, args=(sock,), daemon=True)
+    rcv_thread.start()
 
     print("[MAIN] Recibiendo telemetría. Ctrl+C para salir.")
     try:
@@ -251,7 +249,8 @@ def main():
         stop_event.set()
         sock.close()
         control_sock.close()
-        rx_thread.join(timeout=2.0)
+        rcv_thread.join(timeout=2.0)
+        ctrl_thread.join(timeout=2.0)
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
