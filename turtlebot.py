@@ -3,7 +3,7 @@ import base64
 import struct
 import threading
 import time
-
+from ultralytics import YOLO
 import numpy as np
 import cv2
 
@@ -18,7 +18,7 @@ PAIRING_CODE      = "oscar"
 EXPECTED_ROBOT_NAME = "turtlebotoscar"  # por seguridad extra
 
 # Velocidades
-LIN = 0.90     # m/s
+LIN = 0.60     # m/s
 ANG = 3.00     # rad/s
 
 ROTATION_90_TIME = (np.pi / 2) / ANG  # tiempo aproximado para girar 90 grados
@@ -30,6 +30,7 @@ CONTROL_PERIOD = 1.0 / CONTROL_HZ
 control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 stop_event = threading.Event()
 detector = cv2.QRCodeDetector()
+model = YOLO("best.pt")
 
 state_lock = threading.Lock()
 state = "STOPPED"          # STOPPED, FORWARD, TURN_LEFT, TURN_RIGHT
@@ -177,20 +178,43 @@ def handle_img(parts):
         if qr_data:
             print(f"[IMG] QR detectado: '{qr_data}'")
 
+        sign = None
+        results = model.predict(
+            source=img,
+            imgsz=640,
+            conf=0.1, # <--- De momento, para ver que detecta. Luego, subirlo para evitar falsos positivos
+            verbose=False
+        )
+        result = results[0]
+
+        if len(result.boxes) > 0:
+            confidences = result.boxes.conf.cpu().numpy()
+            idx = np.argmax(confidences)
+
+            cls_id = int(result.boxes.cls[idx])
+            sign = model.names[cls_id]
+
+            conf = confidences[idx]
+            print(f"[YOLO] Detectado: {sign} ({conf:.2f})")
+
         with state_lock:
             currently_turning = state in ("TURN_LEFT", "TURN_RIGHT")
 
         if qr_data and not currently_turning:
-            if qr_data == "milestone_phi":
-                set_state("TURN_RIGHT")
-            elif qr_data == "milestone_rho":
-                set_state("TURN_LEFT")
-            elif qr_data == "milestone_beta":
-                set_state("FORWARD")
-            elif qr_data == "milestone_gamma":
-                set_state("STOPPED")
+            if qr_data == "start":
+                print(f"[DEBUG] Robot avanza")
+                # set_state("FORWARD") # <-- Descomentar cuando modelo funcione bien, hace que el robot se mueva
 
-        cv2.imshow(f"Camara {robot_name} (domain {domain_id})", img)
+        if sign and not currently_turning:
+            if sign == "turn_right":
+                print(f"[DEBUG] Robot gira a la derecha")
+                # set_state("TURN_RIGHT") # <-- Descomentar cuando modelo funcione bien, hace que el robot se mueva
+            elif sign == "turn_left":
+                print(f"[DEBUG] Robot gira a la izquierda")
+                # set_state("TURN_LEFT") # <-- Descomentar cuando modelo funcione bien, hace que el robot se mueva
+            elif sign == "stop":
+                print(f"[DEBUG] Robot se detiene")
+                # set_state("STOPPED") # <-- Descomentar cuando modelo funcione bien, hace que el robot se mueva
         cv2.waitKey(1)
 
     except Exception as e:
