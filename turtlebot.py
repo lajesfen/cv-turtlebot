@@ -4,6 +4,8 @@ import struct
 import threading
 import time
 from ultralytics import YOLO
+from datetime import datetime
+import time
 import numpy as np
 import cv2
 
@@ -21,7 +23,7 @@ EXPECTED_ROBOT_NAME = "turtlebotoscar"  # por seguridad extra
 LIN = 0.60     # m/s
 ANG = 3.00     # rad/s
 
-ROTATION_90_TIME = (np.pi / 2) / ANG  # tiempo aproximado para girar 90 grados
+ROTATION_90_TIME = (np.pi / 2) / ANG * 2  # tiempo aproximado para girar 90 grados
 CONTROL_HZ = 20.0
 CONTROL_PERIOD = 1.0 / CONTROL_HZ
 
@@ -35,6 +37,8 @@ model = YOLO("best.pt")
 state_lock = threading.Lock()
 state = "STOPPED"          # STOPPED, FORWARD, TURN_LEFT, TURN_RIGHT
 turn_deadline = None
+checkpoints = []
+start_time = None
 
 # ========= Helper Functions =========
 
@@ -45,9 +49,18 @@ def send_packet(v: float, w: float):
     )
 
 def set_state(new_state: str):
-    global state, turn_deadline
+    global state, turn_deadline, start_time
+
     with state_lock:
+        if new_state == state:
+            return
+    
+        if start_time is None and new_state == "FORWARD":
+            start_time = time.monotonic()
+            print("Set start time")
+
         state = new_state
+
         if new_state in ("TURN_LEFT", "TURN_RIGHT"):
             turn_deadline = time.monotonic() + ROTATION_90_TIME
         else:
@@ -201,21 +214,24 @@ def handle_img(parts):
             currently_turning = state in ("TURN_LEFT", "TURN_RIGHT")
 
         if qr_data and not currently_turning:
-            if qr_data == "start":
-                print(f"[DEBUG] Robot avanza")
-                # set_state("FORWARD") # <-- Descomentar cuando modelo funcione bien, hace que el robot se mueva
+            if qr_data == "start" and state == "STOPPED":
+                set_state("FORWARD")
+            else:
+                if qr_data not in [checkpoint["data"] for checkpoint in checkpoints]:
+                    if start_time is not None:
+                        elapsed = time.monotonic() - start_time
+                    else:
+                        elapsed = 0.0
+                    checkpoints.append({ "data": qr_data, "time": elapsed })
 
         if sign and not currently_turning:
             if sign == "turn_right":
-                print(f"[DEBUG] Robot gira a la derecha")
-                # set_state("TURN_RIGHT") # <-- Descomentar cuando modelo funcione bien, hace que el robot se mueva
+                set_state("TURN_RIGHT")
             elif sign == "turn_left":
-                print(f"[DEBUG] Robot gira a la izquierda")
-                # set_state("TURN_LEFT") # <-- Descomentar cuando modelo funcione bien, hace que el robot se mueva
+                set_state("TURN_LEFT")
             elif sign == "stop":
-                print(f"[DEBUG] Robot se detiene")
-                # set_state("STOPPED") # <-- Descomentar cuando modelo funcione bien, hace que el robot se mueva
-        cv2.waitKey(1)
+                set_state("STOPPED")
+        # cv2.waitKey(1)
 
     except Exception as e:
         print(f"[IMG] Error manejando imagen: {e}")
@@ -244,6 +260,24 @@ def receive_loop(sock: socket.socket):
 
     print("[RCV] Hilo de recepción terminado.")
 
+def save_checkpoints():
+    try:
+        if len(checkpoints) > 0:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            filename = f"checkpoints-{timestamp}.txt"
+
+            with open(filename, "w") as f:
+                f.write("data\ttime\n")
+                f.write("-" * 30 + "\n")
+
+                for c in checkpoints:
+                    f.write(f"{c['data']}\t{c['time']:.3f}\n")
+
+            print(f"[SAVE] Checkpoints guardados en {filename}")
+
+    except Exception as e:
+        print(f"[SAVE] Error: {e}")
+        
 # ========= Main =========
 
 def main():
@@ -263,7 +297,7 @@ def main():
     rcv_thread = threading.Thread(target=receive_loop, args=(sock,), daemon=True)
     rcv_thread.start()
 
-    print("[MAIN] Recibiendo telemetría. Ctrl+C para salir.")
+    print("[MAIN] Recibiendo telemetría. [CTRL+C] para salir.")
     try:
         while True:
             time.sleep(0.1)
@@ -276,6 +310,8 @@ def main():
         rcv_thread.join(timeout=2.0)
         ctrl_thread.join(timeout=2.0)
         cv2.destroyAllWindows()
+
+        save_checkpoints()
 
 if __name__ == "__main__":
     main()
