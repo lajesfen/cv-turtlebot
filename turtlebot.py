@@ -31,6 +31,7 @@ control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 stop_event = threading.Event()
 detector = cv2.QRCodeDetector()
 model = YOLO("best.pt")
+CLASSIFY_MODE = model.task == "classify"
 
 state_lock = threading.Lock()
 state = "STOPPED"          # STOPPED, FORWARD, TURN_LEFT, TURN_RIGHT
@@ -179,23 +180,32 @@ def handle_img(parts):
             print(f"[IMG] QR detectado: '{qr_data}'")
 
         sign = None
-        results = model.predict(
-            source=img,
-            imgsz=640,
-            conf=0.1, # <--- De momento, para ver que detecta. Luego, subirlo para evitar falsos positivos
-            verbose=False
-        )
-        result = results[0]
+        if CLASSIFY_MODE:
+            results = model.predict(source=img, imgsz=224, verbose=False)
+            result = results[0]
+            if result.probs is not None:
+                top1 = int(result.probs.top1)
+                sign = model.names[top1]
+                conf = float(result.probs.top1conf)
+                print(f"[YOLO] Clasificado: {sign} ({conf:.2f})")
+        else:
+            results = model.predict(
+                source=img,
+                imgsz=640,
+                conf=0.4,
+                verbose=False
+            )
+            result = results[0]
 
-        if len(result.boxes) > 0:
-            confidences = result.boxes.conf.cpu().numpy()
-            idx = np.argmax(confidences)
+            if len(result.boxes) > 0:
+                confidences = result.boxes.conf.cpu().numpy()
+                idx = np.argmax(confidences)
 
-            cls_id = int(result.boxes.cls[idx])
-            sign = model.names[cls_id]
+                cls_id = int(result.boxes.cls[idx])
+                sign = model.names[cls_id]
 
-            conf = confidences[idx]
-            print(f"[YOLO] Detectado: {sign} ({conf:.2f})")
+                conf = confidences[idx]
+                print(f"[YOLO] Detectado: {sign} ({conf:.2f})")
 
         with state_lock:
             currently_turning = state in ("TURN_LEFT", "TURN_RIGHT")

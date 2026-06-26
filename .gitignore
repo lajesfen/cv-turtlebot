@@ -1,2 +1,8 @@
 .DS_Store
 .venv
+dataset/
+dataset_classify/
+runs/
+yolov8n.pt
+yolov8n-cls.pt
+yolo11n.pt

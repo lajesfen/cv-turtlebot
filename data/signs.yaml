@@ -1,0 +1,9 @@
+# Dataset de señales TurtleBot — generado por prepare_dataset.py
+path: /Users/luis.jauregui/Clases/Computer Vision/proyecto2/cv-turtlebot/dataset
+train: images/train
+val: images/val
+
+names:
+  0: turn_left
+  1: turn_right
+  2: stop
