@@ -20,7 +20,7 @@ PAIRING_CODE      = "oscar"
 EXPECTED_ROBOT_NAME = "turtlebotoscar"  # por seguridad extra
 
 # Velocidades
-LIN = 0.60     # m/s
+LIN = 0.20     # m/s
 ANG = 3.00     # rad/s
 
 ROTATION_90_TIME = (np.pi / 2) / ANG * 2  # tiempo aproximado para girar 90 grados
@@ -235,7 +235,7 @@ def handle_img(parts):
         results = model.predict(
             source=img,
             imgsz=640,
-            conf=0.4, # <--- De momento, para ver que detecta. Luego, subirlo para evitar falsos positivos
+            conf=0.1, # <--- De momento, para ver que detecta. Luego, subirlo para evitar falsos positivos
             verbose=False
         )
         result = results[0]
@@ -249,6 +249,8 @@ def handle_img(parts):
 
             conf = confidences[idx]
             print(f"[YOLO] Detectado: {sign} ({conf:.2f})")
+
+        print(f"[DEBUG] Valor de sign: {sign}")
 
         if sign and not currently_turning and is_running:
             if sign == "turn_right":
