@@ -11,7 +11,7 @@ import cv2
 
 # ========= Configuración =========
 
-ROBOT_IP   = "192.168.0.101"  # IP del TurtleBot4
+ROBOT_IP   = "192.168.0.104"  # IP del TurtleBot4
 ROBOT_PORT = 6000             # Debe coincidir con el nodo de telemetría
 CONTROL_PORT = 5007           # Puerto para enviar comandos
 
@@ -27,6 +27,11 @@ ROTATION_90_TIME = (np.pi / 2) / ANG * 2  # tiempo aproximado para girar 90 grad
 CONTROL_HZ = 20.0
 CONTROL_PERIOD = 1.0 / CONTROL_HZ
 
+STATE_STOPPED = "STOPPED"
+STATE_FORWARD = "FORWARD"
+STATE_TURN_LEFT = "TURN_LEFT"
+STATE_TURN_RIGHT = "TURN_RIGHT"
+
 # ========= Variables Globales =========
 
 control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -35,7 +40,8 @@ detector = cv2.QRCodeDetector()
 model = YOLO("best.pt")
 
 state_lock = threading.Lock()
-state = "STOPPED"          # STOPPED, FORWARD, TURN_LEFT, TURN_RIGHT
+state = STATE_STOPPED
+is_running = False
 turn_deadline = None
 checkpoints = []
 start_time = None
@@ -49,19 +55,23 @@ def send_packet(v: float, w: float):
     )
 
 def set_state(new_state: str):
-    global state, turn_deadline, start_time
-
+    global state, turn_deadline, start_time, is_running
+    
     with state_lock:
         if new_state == state:
             return
-    
-        if start_time is None and new_state == "FORWARD":
-            start_time = time.monotonic()
-            print("Set start time")
-
+        
+        print(f"[STATE] Transitioning from {state} -> {new_state}")
+        
+        if new_state == STATE_FORWARD and not is_running:
+            is_running = True
+            if start_time is None:
+                start_time = time.monotonic()
+                print("[STATE] Global start time initiated.")
+        
         state = new_state
-
-        if new_state in ("TURN_LEFT", "TURN_RIGHT"):
+        
+        if new_state in (STATE_TURN_LEFT, STATE_TURN_RIGHT):
             turn_deadline = time.monotonic() + ROTATION_90_TIME
         else:
             turn_deadline = None
@@ -69,24 +79,32 @@ def set_state(new_state: str):
 def control_loop():
     print("[CTRL] Hilo de control iniciado.")
     while not stop_event.is_set():
+        turn_finished = False
         with state_lock:
             current_state = state
             deadline = turn_deadline
+            
+            if current_state in (STATE_TURN_LEFT, STATE_TURN_RIGHT) and deadline is not None:
+                if time.monotonic() >= deadline:
+                    current_state = STATE_FORWARD
+                    turn_finished = True
+                else:
+                    turn_finished = False
+            else:
+                turn_finished = False
 
-        if current_state in ("TURN_LEFT", "TURN_RIGHT") and deadline is not None and time.monotonic() >= deadline:
-            set_state("STOPPED")
-            with state_lock:
-                current_state = state
-
-        if current_state == "FORWARD":
-            send_packet(+LIN, 0.0)
-        elif current_state == "TURN_LEFT":
-            send_packet(0.0, +ANG)
-        elif current_state == "TURN_RIGHT":
-            send_packet(0.0, -ANG)
-        else:
-            send_packet(0.0, 0.0)
-
+            if current_state == STATE_FORWARD:
+                send_packet(+LIN, 0.0)
+            elif current_state == STATE_TURN_LEFT:
+                send_packet(0.0, +ANG)
+            elif current_state == STATE_TURN_RIGHT:
+                send_packet(0.0, -ANG)
+            else:
+                send_packet(0.0, 0.0)
+                
+        if turn_finished:
+            set_state(STATE_FORWARD)
+            
         time.sleep(CONTROL_PERIOD)
     print("[CTRL] Hilo de control terminado.")
 
@@ -186,21 +204,43 @@ def handle_img(parts):
         if img is None:
             print("[IMG] Error al decodificar imagen.")
             return
+        
+        with state_lock:
+            current_state = state
+            currently_turning = current_state in (STATE_TURN_LEFT, STATE_TURN_RIGHT)
+
+        # === QR Detection ===
 
         qr_data, vertices, _ = detector.detectAndDecode(img)
         if qr_data:
             print(f"[IMG] QR detectado: '{qr_data}'")
+            
+            if qr_data == "start":
+                if not currently_turning:
+                    set_state(STATE_FORWARD)
+            else:
+                if is_running and qr_data not in [cp["data"] for cp in checkpoints]:
+                    elapsed = time.monotonic() - start_time if start_time else 0
+                    hours = int(elapsed // 3600)
+                    minutes = int((elapsed % 3600) // 60)
+                    seconds = elapsed % 60
+                    timestamp = f"{hours:02}:{minutes:02}:{seconds:06.3f}"
+                    
+                    checkpoints.append({"data": qr_data, "time": timestamp})
+                    print(f"[CHECKPOINT] Saved: {qr_data} at {timestamp}")
+
+        # === YOLO Detection ===
 
         sign = None
         results = model.predict(
             source=img,
             imgsz=640,
-            conf=0.1, # <--- De momento, para ver que detecta. Luego, subirlo para evitar falsos positivos
+            conf=0.4, # <--- De momento, para ver que detecta. Luego, subirlo para evitar falsos positivos
             verbose=False
         )
         result = results[0]
 
-        if len(result.boxes) > 0:
+        if result.boxes is not None and len(result.boxes) > 0:
             confidences = result.boxes.conf.cpu().numpy()
             idx = np.argmax(confidences)
 
@@ -210,29 +250,15 @@ def handle_img(parts):
             conf = confidences[idx]
             print(f"[YOLO] Detectado: {sign} ({conf:.2f})")
 
-        with state_lock:
-            currently_turning = state in ("TURN_LEFT", "TURN_RIGHT")
-
-        if qr_data and not currently_turning:
-            if qr_data == "start" and state == "STOPPED":
-                set_state("FORWARD")
-            else:
-                if qr_data not in [checkpoint["data"] for checkpoint in checkpoints]:
-                    if start_time is not None:
-                        elapsed = time.monotonic() - start_time
-                    else:
-                        elapsed = 0.0
-                    checkpoints.append({ "data": qr_data, "time": elapsed })
-
-        if sign and not currently_turning:
+        if sign and not currently_turning and is_running:
             if sign == "turn_right":
-                set_state("TURN_RIGHT")
+                set_state(STATE_TURN_RIGHT)
             elif sign == "turn_left":
-                set_state("TURN_LEFT")
+                set_state(STATE_TURN_LEFT)
             elif sign == "stop":
-                set_state("STOPPED")
-        # cv2.waitKey(1)
-
+                set_state(STATE_STOPPED)
+        
+        cv2.waitKey(1)
     except Exception as e:
         print(f"[IMG] Error manejando imagen: {e}")
 
@@ -271,7 +297,7 @@ def save_checkpoints():
                 f.write("-" * 30 + "\n")
 
                 for c in checkpoints:
-                    f.write(f"{c['data']}\t{c['time']:.3f}\n")
+                    f.write(f"{c['data']}\t{c['time']}\n")
 
             print(f"[SAVE] Checkpoints guardados en {filename}")
 
@@ -304,6 +330,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[MAIN] Cerrando...")
     finally:
+        save_checkpoints()
         stop_event.set()
         sock.close()
         control_sock.close()
@@ -311,7 +338,6 @@ def main():
         ctrl_thread.join(timeout=2.0)
         cv2.destroyAllWindows()
 
-        save_checkpoints()
 
 if __name__ == "__main__":
     main()
