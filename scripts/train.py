@@ -23,7 +23,7 @@ def main() -> None:
     default="yolov8n.pt",
     help="Checkpoint base (yolov8n.pt, yolo11n.pt, etc.)",
   )
-  parser.add_argument("--epochs", type=int, default=100)
+  parser.add_argument("--epochs", type=int, default=150)
   parser.add_argument("--imgsz", type=int, default=640)
   parser.add_argument("--batch", type=int, default=8)
   parser.add_argument("--device", default="", help="cuda, cpu, mps o vacío para auto")
@@ -52,22 +52,24 @@ def main() -> None:
     project=str(args.project),
     name=args.name,
     exist_ok=True,
-    patience=20,
+    patience=25,
     save=True,
     plots=True,
-    # Augmentación útil para dataset pequeño y cámara en movimiento
+    # Augmentación para dataset pequeño y señales pequeñas en frame
     hsv_h=0.015,
     hsv_s=0.5,
     hsv_v=0.4,
-    degrees=15,
+    degrees=10,
     translate=0.1,
-    scale=0.5,
+    scale=0.4,
     shear=2.0,
     perspective=0.0005,
     flipud=0.0,
     fliplr=0.5,
-    mosaic=1.0,
-    mixup=0.1,
+    mosaic=0.5,
+    mixup=0.0,
+    copy_paste=0.0,
+    close_mosaic=15,
   )
 
   best = Path(results.save_dir) / "weights" / "best.pt"
@@ -75,6 +77,10 @@ def main() -> None:
   if best.exists():
     target.write_bytes(best.read_bytes())
     print(f"\n[OK] Mejor modelo copiado a: {target}")
+    print("\nProbar en imágenes:")
+    print("  python scripts/predict.py --save")
+    print("En el robot:")
+    print("  python turtlebot.py")
   else:
     print(f"\n[WARN] No se encontró best.pt en {results.save_dir}")
 
