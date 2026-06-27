@@ -3,6 +3,7 @@ import base64
 import struct
 import threading
 import time
+from datetime import datetime
 from ultralytics import YOLO
 import numpy as np
 import cv2
@@ -18,10 +19,10 @@ PAIRING_CODE      = "oscar"
 EXPECTED_ROBOT_NAME = "turtlebotoscar"  # por seguridad extra
 
 # Velocidades
-LIN = 0.60     # m/s
+LIN = 0.20     # m/s
 ANG = 3.00     # rad/s
 
-ROTATION_90_TIME = (np.pi / 2) / ANG  # tiempo aproximado para girar 90 grados
+ROTATION_90_TIME = (np.pi / 2) / ANG * 2  # tiempo aproximado para girar 90 grados
 CONTROL_HZ = 20.0
 CONTROL_PERIOD = 1.0 / CONTROL_HZ
 
@@ -31,8 +32,15 @@ SIGN_CONF_THRESHOLD = 0.40       # mínimo conf del bbox para considerar señal
 SIGN_ARM_FRAMES = 2              # frames consecutivos antes de armar acción
 OBSTACLE_STOP_M = 0.10           # nunca avanzar si algo está a menos de esto
 ACTION_DISTANCE_M = 0.10         # ejecutar giro/parada de señal a esta distancia (LiDAR)
-LIDAR_FRONT_HALF_RAD = np.deg2rad(35)  # arco frontal para obstáculos y proximidad a señal
+LIDAR_FRONT_HALF_RAD = np.deg2rad(35)
 LIDAR_MAX_VALID_M = 12.0
+
+# Estados
+STATE_STOPPED = "STOPPED"
+STATE_FORWARD = "FORWARD"
+STATE_ARMED = "ARMED"
+STATE_TURN_LEFT = "TURN_LEFT"
+STATE_TURN_RIGHT = "TURN_RIGHT"
 
 # ========= Variables Globales =========
 
@@ -43,17 +51,15 @@ model = YOLO("best.pt")
 CLASSIFY_MODE = model.task == "classify"
 
 state_lock = threading.RLock()
-# STOPPED → espera QR start
-# FORWARD → avance neutro (sin señal válida)
-# ARMED   → señal vista a distancia, pending_sign cargado
-# TURN_*  → ejecutando giro
-state = "STOPPED"
+state = STATE_STOPPED
+is_running = False
 turn_deadline = None
+start_time = None
+checkpoints = []
+
 pending_sign = None          # turn_left | turn_right | stop
 min_front_range_m = float("inf")
-race_started = False
 
-# Debounce de visión (solo handle_img escribe, bajo state_lock al actualizar)
 _sign_streak_label = None
 _sign_streak_count = 0
 
@@ -67,29 +73,40 @@ def send_packet(v: float, w: float):
 
 
 def set_state(new_state: str):
-    global state, turn_deadline, pending_sign
+    global state, turn_deadline, pending_sign, start_time, is_running
+
     with state_lock:
-        prev = state
+        if new_state == state:
+            return
+
+        print(f"[STATE] {state} → {new_state}")
+
+        if new_state == STATE_FORWARD and not is_running:
+            is_running = True
+            if start_time is None:
+                start_time = time.monotonic()
+                print("[STATE] Tiempo de carrera iniciado.")
+
         state = new_state
-        if new_state in ("TURN_LEFT", "TURN_RIGHT"):
+
+        if new_state in (STATE_TURN_LEFT, STATE_TURN_RIGHT):
             turn_deadline = time.monotonic() + ROTATION_90_TIME
         else:
             turn_deadline = None
-        if new_state not in ("ARMED",):
+
+        if new_state != STATE_ARMED:
             pending_sign = None
-    if prev != new_state:
-        print(f"[STATE] {prev} → {new_state}")
 
 
 def arm_sign(sign: str):
     """Registra señal vista a distancia; la acción se ejecuta al llegar a 10 cm."""
     global state, pending_sign
     with state_lock:
-        if state not in ("FORWARD", "ARMED"):
+        if state not in (STATE_FORWARD, STATE_ARMED):
             return
         pending_sign = sign
-        if state != "ARMED":
-            state = "ARMED"
+        if state != STATE_ARMED:
+            state = STATE_ARMED
             print(f"[ARMED] Señal '{sign}' registrada — avanzando hasta ~{ACTION_DISTANCE_M*100:.0f} cm")
 
 
@@ -101,11 +118,11 @@ def execute_pending_sign():
             return
 
     if sign == "turn_left":
-        set_state("TURN_LEFT")
+        set_state(STATE_TURN_LEFT)
     elif sign == "turn_right":
-        set_state("TURN_RIGHT")
+        set_state(STATE_TURN_RIGHT)
     elif sign == "stop":
-        set_state("STOPPED")
+        set_state(STATE_STOPPED)
     print(f"[ACTION] Ejecutando señal '{sign}' a ~{ACTION_DISTANCE_M*100:.0f} cm")
 
 
@@ -165,43 +182,61 @@ def update_sign_streak(sign: str | None) -> str | None:
     return None
 
 
+def save_checkpoints():
+    try:
+        if len(checkpoints) > 0:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            filename = f"checkpoints-{timestamp}.txt"
+
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write("data\ttime\n")
+                f.write("-" * 30 + "\n")
+                for c in checkpoints:
+                    f.write(f"{c['data']}\t{c['time']}\n")
+
+            print(f"[SAVE] Checkpoints guardados en {filename}")
+    except Exception as e:
+        print(f"[SAVE] Error: {e}")
+
+
 def control_loop():
     print("[CTRL] Hilo de control iniciado.")
     while not stop_event.is_set():
+        turn_finished = False
+        should_execute_sign = False
+
         with state_lock:
             current_state = state
             deadline = turn_deadline
             front_m = min_front_range_m
             armed_sign = pending_sign
 
-        # Giro completado → volver a avance neutro
-        if current_state in ("TURN_LEFT", "TURN_RIGHT") and deadline is not None and time.monotonic() >= deadline:
-            set_state("FORWARD")
-            with state_lock:
-                current_state = state
+            if current_state in (STATE_TURN_LEFT, STATE_TURN_RIGHT) and deadline is not None:
+                if time.monotonic() >= deadline:
+                    current_state = STATE_FORWARD
+                    turn_finished = True
 
-        obstacle_close = front_m <= OBSTACLE_STOP_M
+            obstacle_close = front_m <= OBSTACLE_STOP_M
 
-        # Prioridad 1: obstáculo frontal < 10 cm → nunca avanzar
-        if obstacle_close and current_state in ("FORWARD", "ARMED"):
-            if current_state == "ARMED" and armed_sign is not None:
-                execute_pending_sign()
+            if obstacle_close and current_state in (STATE_FORWARD, STATE_ARMED):
+                if current_state == STATE_ARMED and armed_sign is not None:
+                    should_execute_sign = True
+                send_packet(0.0, 0.0)
+            elif current_state == STATE_FORWARD:
+                send_packet(+LIN, 0.0)
+            elif current_state == STATE_ARMED:
+                send_packet(+LIN, 0.0)
+            elif current_state == STATE_TURN_LEFT:
+                send_packet(0.0, +ANG)
+            elif current_state == STATE_TURN_RIGHT:
+                send_packet(0.0, -ANG)
             else:
                 send_packet(0.0, 0.0)
-            time.sleep(CONTROL_PERIOD)
-            continue
 
-        if current_state == "FORWARD":
-            send_packet(+LIN, 0.0)
-        elif current_state == "ARMED":
-            # Señal lejana: seguir avanzando hasta que LiDAR dispare la acción
-            send_packet(+LIN, 0.0)
-        elif current_state == "TURN_LEFT":
-            send_packet(0.0, +ANG)
-        elif current_state == "TURN_RIGHT":
-            send_packet(0.0, -ANG)
-        else:
-            send_packet(0.0, 0.0)
+        if turn_finished:
+            set_state(STATE_FORWARD)
+        elif should_execute_sign:
+            execute_pending_sign()
 
         time.sleep(CONTROL_PERIOD)
     print("[CTRL] Hilo de control terminado.")
@@ -277,7 +312,7 @@ def handle_scan(parts):
 
 
 def handle_img(parts):
-    global race_started, _sign_streak_label, _sign_streak_count
+    global _sign_streak_label, _sign_streak_count
 
     if len(parts) < 6:
         print("[IMG] Mensaje demasiado corto.")
@@ -293,35 +328,45 @@ def handle_img(parts):
             print("[IMG] Error al decodificar imagen.")
             return
 
+        with state_lock:
+            current_state = state
+            currently_turning = current_state in (STATE_TURN_LEFT, STATE_TURN_RIGHT)
+
+        # === QR ===
         qr_data, _, _ = detector.detectAndDecode(img)
         if qr_data:
             print(f"[IMG] QR detectado: '{qr_data}'")
 
+            if qr_data == "start":
+                if not currently_turning:
+                    _sign_streak_label = None
+                    _sign_streak_count = 0
+                    set_state(STATE_FORWARD)
+                    print("[QR] Carrera iniciada — avance neutro")
+            elif is_running and qr_data not in [cp["data"] for cp in checkpoints]:
+                elapsed = time.monotonic() - start_time if start_time else 0
+                hours = int(elapsed // 3600)
+                minutes = int((elapsed % 3600) // 60)
+                seconds = elapsed % 60
+                timestamp = f"{hours:02}:{minutes:02}:{seconds:06.3f}"
+                checkpoints.append({"data": qr_data, "time": timestamp})
+                print(f"[CHECKPOINT] {qr_data} @ {timestamp}")
+
+        # === YOLO ===
         sign, conf = detect_sign(img)
         if sign:
             print(f"[YOLO] Señal detectada: {sign} ({conf:.2f})")
         else:
-            print(f"[YOLO] Sin señal en frame")
+            print("[YOLO] Sin señal en frame")
 
-        with state_lock:
-            currently_turning = state in ("TURN_LEFT", "TURN_RIGHT")
-            current_state = state
-
-        if qr_data == "start" and not currently_turning:
-            race_started = True
-            _sign_streak_label = None
-            _sign_streak_count = 0
-            set_state("FORWARD")
-            print("[QR] Carrera iniciada — avance neutro")
-
-        if not race_started or currently_turning:
+        if not is_running or currently_turning:
             return
 
-        if current_state == "STOPPED":
+        if current_state == STATE_STOPPED:
             return
 
         confirmed = update_sign_streak(sign)
-        if confirmed and current_state in ("FORWARD", "ARMED"):
+        if confirmed and current_state in (STATE_FORWARD, STATE_ARMED):
             arm_sign(confirmed)
 
         cv2.waitKey(1)
@@ -377,6 +422,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[MAIN] Cerrando...")
     finally:
+        save_checkpoints()
         stop_event.set()
         sock.close()
         control_sock.close()
