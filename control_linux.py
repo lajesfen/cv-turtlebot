@@ -6,8 +6,8 @@ import select
 import termios
 import tty
 
-ROBOT_IP = "172.21.136.102"
-ROBOT_PORT = 5007
+ROBOT_IP = "192.168.0.100"
+ROBOT_PORT = 5007 # no sé
 
 SEND_HZ = 60  # un poco más alto, igual tu receiver publica a 50Hz
 

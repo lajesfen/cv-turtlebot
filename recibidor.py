@@ -6,12 +6,12 @@ import numpy as np
 import cv2
 
 # ========= Configuración =========
-ROBOT_IP   = "10.153.100.177"  # IP del TurtleBot4
+ROBOT_IP   = "192.168.0.101"  # IP del TurtleBot4
 ROBOT_PORT = 6000              # Debe coincidir con el nodo de telemetría
 
-DESIRED_DOMAIN_ID = 21          # Debe coincidir con ROS_DOMAIN_ID del robot
-PAIRING_CODE      = "ROBOT_A_42"
-EXPECTED_ROBOT_NAME = "turtlebot4_lite_1"  # por seguridad extra
+DESIRED_DOMAIN_ID = 67          # Debe coincidir con ROS_DOMAIN_ID del robot
+PAIRING_CODE      = "oscar"
+EXPECTED_ROBOT_NAME = "turtlebotoscar"  # por seguridad extra
 
 
 def do_handshake(sock: socket.socket, robot_addr):
