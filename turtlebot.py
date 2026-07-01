@@ -32,12 +32,20 @@ STATE_FORWARD = "FORWARD"
 STATE_TURN_LEFT = "TURN_LEFT"
 STATE_TURN_RIGHT = "TURN_RIGHT"
 
+CAMERA_HORIZONTAL_FOV = np.deg2rad(69.0)   # Raspberry Pi Camera v2 ≈ 62-69°
+LIDAR_DISTANCE_WINDOW = np.deg2rad(5)      # Search ±5° around the detected sign
+
+SIGN_TRIGGER_DISTANCE = 0.30                   # meters
+
 # ========= Variables Globales =========
 
 control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 stop_event = threading.Event()
 detector = cv2.QRCodeDetector()
+
+print("Loading YOLO...")
 model = YOLO("best.pt")
+print("YOLO loaded.")
 
 state_lock = threading.Lock()
 state = STATE_STOPPED
@@ -45,6 +53,10 @@ is_running = False
 turn_deadline = None
 checkpoints = []
 start_time = None
+
+latest_ranges = None
+latest_angle_min = None
+latest_angle_inc = None
 
 # ========= Helper Functions =========
 
@@ -150,11 +162,29 @@ def do_handshake(sock: socket.socket, robot_addr):
         except socket.timeout:
             print("[HANDSHAKE] Timeout esperando ACK, reintentando...")
 
+def lidar_distance_at_angle(ranges, angle_min, angle_inc, target_angle, window=LIDAR_DISTANCE_WINDOW):
+    best = float("inf")
+    for i, raw in enumerate(ranges):
+        r = float(raw)
+        if not np.isfinite(r) or r <= 0.0:
+            continue
+
+        angle = angle_min + i * angle_inc
+        while angle > np.pi:
+            angle -= 2*np.pi
+        while angle < -np.pi:
+            angle += 2*np.pi
+
+        if abs(angle - target_angle) <= window:
+            best = min(best, r)
+    return best
+
 def handle_scan(parts):
     """
     parts: lista de strings del mensaje:
     SCAN <domain_id> <robot_name> <sec> <nsec> <angle_min> <angle_inc> <n> r1 ... rn
     """
+    global latest_ranges, latest_angle_min, latest_angle_inc
     if len(parts) < 8:
         print("[SCAN] Mensaje demasiado corto.")
         return
@@ -167,18 +197,16 @@ def handle_scan(parts):
         angle_min = float(parts[5])
         angle_inc = float(parts[6])
         n = int(parts[7])
-
         ranges_str = parts[8:]
         if len(ranges_str) != n:
             print(f"[SCAN] n={n} pero llegaron {len(ranges_str)} rangos. Usando min(len, n).")
         n_effective = min(n, len(ranges_str))
         ranges = [float(r) for r in ranges_str[:n_effective]]
 
-        # Aquí puedes hacer lo que quieras con el LIDAR.
-        # Demo: imprimir algunos valores cada vez.
-        print(f"[SCAN] robot={robot_name} domain={domain_id} "
-              f"t={sec}.{nsec:09d} n={n_effective} "
-              f"ejemplo={ranges[:5]}")
+        with state_lock:
+            latest_ranges = ranges
+            latest_angle_min = angle_min
+            latest_angle_inc = angle_inc
 
     except ValueError as e:
         print(f"[SCAN] Error parseando mensaje: {e}")
@@ -235,7 +263,7 @@ def handle_img(parts):
         results = model.predict(
             source=img,
             imgsz=640,
-            conf=0.1, # <--- De momento, para ver que detecta. Luego, subirlo para evitar falsos positivos
+            conf=0.8,
             verbose=False
         )
         result = results[0]
@@ -244,21 +272,62 @@ def handle_img(parts):
             confidences = result.boxes.conf.cpu().numpy()
             idx = np.argmax(confidences)
 
+            box = result.boxes.xyxy[idx].cpu().numpy()
+            x1, y1, x2, y2 = box
+            image_width = img.shape[1]
+            center_x = (x1 + x2) / 2
+            normalized = (center_x - image_width/2) / (image_width/2)
+            target_angle = normalized * (CAMERA_HORIZONTAL_FOV / 2)
+
+            with state_lock:
+                if latest_ranges is not None:
+                    sign_distance = lidar_distance_at_angle(
+                        latest_ranges,
+                        latest_angle_min,
+                        latest_angle_inc,
+                        target_angle
+                    )
+                else:
+                    sign_distance = float("inf")
+
             cls_id = int(result.boxes.cls[idx])
             sign = model.names[cls_id]
 
             conf = confidences[idx]
-            print(f"[YOLO] Detectado: {sign} ({conf:.2f})")
+            print(
+                f"[YOLO] {sign} "
+                f"conf={conf:.2f} "
+                f"angle={np.rad2deg(target_angle):.1f}° "
+                f"distance={sign_distance:.2f} m"
+            )
 
-        print(f"[DEBUG] Valor de sign: {sign}")
+            if not sign or currently_turning or not is_running:
+                return
 
-        if sign and not currently_turning and is_running:
+            if not np.isfinite(sign_distance):
+                print("[YOLO] No valid LiDAR reading for detected sign.")
+                return
+
+            if sign_distance > SIGN_TRIGGER_DISTANCE:
+                print(f"[YOLO] {sign} detected ({sign_distance:.2f} m) - waiting...")
+                return
+
+            print(f"[YOLO] {sign} detected ({sign_distance:.2f} m) - EXECUTING")
+
             if sign == "turn_right":
                 set_state(STATE_TURN_RIGHT)
             elif sign == "turn_left":
                 set_state(STATE_TURN_LEFT)
             elif sign == "stop":
                 set_state(STATE_STOPPED)
+
+        # if sign and not currently_turning and is_running:
+        #     if sign == "turn_right":
+        #         set_state(STATE_TURN_RIGHT)
+        #     elif sign == "turn_left":
+        #         set_state(STATE_TURN_LEFT)
+        #     elif sign == "stop":
+        #         set_state(STATE_STOPPED)
         
         cv2.waitKey(1)
     except Exception as e:
@@ -279,7 +348,7 @@ def receive_loop(sock: socket.socket):
 
         msg_type = parts[0]
         if msg_type == "SCAN":
-            # handle_scan(parts)
+            handle_scan(parts)
             pass
         elif msg_type == "IMG":
             handle_img(parts)
@@ -317,7 +386,9 @@ def main():
     robot_addr = (ROBOT_IP, ROBOT_PORT)
 
     # 1) Handshake
+    print("Starting handshake...")
     do_handshake(sock, robot_addr)
+    print("Handshake finished.")
 
     ctrl_thread = threading.Thread(target=control_loop, daemon=True)
     ctrl_thread.start()
