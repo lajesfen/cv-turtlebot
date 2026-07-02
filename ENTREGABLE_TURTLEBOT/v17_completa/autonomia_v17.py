@@ -29,7 +29,7 @@
 #
 # CALIBRA FRONT_DEG ANTES DE CONFIAR EN ESTO (usa diag_lidar.py o el log [IDLE]).
 # Signos (ROS REP-103): angular.z > 0 = IZQUIERDA (CCW); < 0 = DERECHA (CW).
-# Correr:  export ROS_DOMAIN_ID=67 && python3 ~/autonomia_v16.py
+# Correr:  export ROS_DOMAIN_ID=67 && python3 ~/autonomia_v17.py
 # NO correr junto con otros nodos que publiquen cmd_vel.
 # =====================================================================================
 import time
@@ -60,8 +60,9 @@ except Exception:
     HAS_HAZARD = False
 
 # ============================== CONFIG (m, rad/s, grados) =============================
-USE_STAMPED = True      # ESTE robot (post-reflash) obedece TwistStamped en /cmd_vel.
-                        # Si tu compañero usa otro topic/tipo, ajusta aqui para igualarlo.
+USE_STAMPED = False     # ESTE robot NO fue reflasheado: se mueve con Twist en /cmd_vel_unstamped
+                        # (lo escucha create3_repub, best_effort). /cmd_vel (TwistStamped) tiene 0
+                        # suscriptores en este robot -> NO mueve. Verificar: ros2 topic info /cmd_vel -v
 START_ARMED = False
 STAGE       = 1
 QR_LOG_FILE = "/home/ubuntu/checkpoints_log.txt"
@@ -511,10 +512,16 @@ class AutonomiaV17(Node):
         # Queda COMPROMETIDO con la direccion hasta despejar el frente.
         sign = self._consume_sign()
         if sign is not None:
-            self.rot_dir = sign
-            self._enter("ROTATE")
-            self.get_logger().info(f">>> EXPLORE por SENAL YOLO -> {'IZQ' if sign > 0 else 'DER'}")
-            return
+            # v17.2 PROTECCION: obedece la senal SOLO si ese lado tiene un hueco transitable.
+            # Si la senal apunta a una pared (falso positivo del YOLO), la ignora -> no hay forma
+            # de chocar; cae al hueco seguro de abajo (re-analiza y toma otra salida).
+            cand = [g for g in self.gaps_list(scan, ROBOT_PASS) if (g[0] >= 0) == (sign > 0)]
+            if cand:
+                self.rot_dir = sign
+                self._enter("ROTATE")
+                self.get_logger().info(f">>> EXPLORE por SENAL YOLO -> {'IZQ' if sign > 0 else 'DER'}")
+                return
+            self.get_logger().info(">>> SENAL hacia lado bloqueado -> la ignoro, tomo hueco seguro")
         h = self.mejor_hueco(scan, use_stick=False)
         if h is not None:
             self.rot_dir = 1.0 if h[0] >= 0 else -1.0

@@ -81,9 +81,9 @@ except Exception:
     HAS_HAZARD = False
 
 # ============================== CONFIG (m, rad/s, grados) =============================
-USE_STAMPED = True      # ESTE robot (estado actual, post-reflash) obedece TwistStamped en /cmd_vel.
-                        # El viejo Twist en /cmd_vel_unstamped llega a /_do_not_use/cmd_vel pero NO mueve.
-                        # Si tu compañero usa otro topic/tipo, ajusta aqui para igualarlo.
+USE_STAMPED = False     # ESTE robot NO fue reflasheado: se mueve con Twist en /cmd_vel_unstamped
+                        # (lo escucha create3_repub, best_effort). /cmd_vel (TwistStamped) tiene 0
+                        # suscriptores en este robot -> NO mueve. Verificar: ros2 topic info /cmd_vel -v
 START_ARMED = False
 STAGE       = 1
 QR_LOG_FILE = "/home/ubuntu/checkpoints_log.txt"

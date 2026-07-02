@@ -6,7 +6,37 @@ expira por tiempo Y distancia (anti-fantasma), rescate rápido (PROBE 1.5 s), y 
 al registrar cada checkpoint QR.
 
 > Para comportarte EXACTO como v16 (sin memoria anti-loop) pon `USE_MEMORY = False` en la
-> línea 145 de `autonomia_v17.py`.
+> línea 146 de `autonomia_v17.py`.
+
+---
+
+## ⚠️⚠️ SI LE DAS `g` Y EL ROBOT NO SE MUEVE — LEER ESTO PRIMERO ⚠️⚠️
+
+Este robot **NO está reflasheado**. Se maneja con `Twist` en **`/cmd_vel_unstamped`** (lo escucha
+el nodo `create3_repub`), NO con `TwistStamped` en `/cmd_vel`. Por eso el archivo viene con:
+
+> **`USE_STAMPED = False`  (línea 63 de `autonomia_v17.py`)**
+
+**Si armás con `g`, el log dice `ARMADO` y el LiDAR imprime, PERO las ruedas no giran**, casi
+siempre es este topic. Cámbialo a mano en el robot y relanza (NO hace falta re-`scp`):
+```bash
+nano ~/autonomia_v17.py      # edita la línea 63: USE_STAMPED = False  <->  True
+# guardar (Ctrl+O, Enter, Ctrl+X) y relanzar (Paso 3)
+```
+
+**Cómo saber cuál va (en el robot, 15 s):**
+```bash
+ros2 topic info /cmd_vel -v            # mira "Subscription count"
+ros2 topic info /cmd_vel_unstamped -v
+```
+- `/cmd_vel_unstamped` con 1 suscriptor (`create3_repub`) → `USE_STAMPED = False` (lo actual, correcto).
+- `/cmd_vel` con 1 suscriptor y `/cmd_vel_unstamped` con 0 (robot reflasheado) → `USE_STAMPED = True`.
+
+**Prueba directa de que el robot obedece** (robot EN EL PISO, fuera del dock):
+```bash
+ros2 topic pub --rate 10 --qos-reliability best_effort /cmd_vel_unstamped geometry_msgs/msg/Twist "{linear: {x: 0.1}}"
+```
+Si avanzan las ruedas → `USE_STAMPED = False` es lo correcto. `Ctrl+C` para parar.
 
 ## Qué corre dónde
 | Archivo | Máquina | Rol |
@@ -133,7 +163,7 @@ export ROS_DOMAIN_ID=67
 python3 ~/diag_lidar.py
 ```
 Pon un objeto plano justo al frente del robot. Anota el valor sugerido y ponlo en `FRONT_DEG`
-(línea 107 de `autonomia_v17.py`). **Valor calibrado actual: `-90.0`**.
+(línea 108 de `autonomia_v17.py`). **Valor calibrado actual: `-90.0`**.
 
 ### Verificar lectura de QR
 ```bash
@@ -183,6 +213,62 @@ En la laptop (una sola PowerShell, carpeta `v14_joyita/`):
 python control_teclas.py
 ```
 Recuerda enviar `autonomia_v14.py` al robot antes con `scp` (Paso 1 del README de v14).
+
+---
+
+## 🩺 DIAGNÓSTICO — si algo no funciona, corre ESTO en el robot y pásame la salida completa
+
+Copia-pega el bloque entero en la sesión SSH del robot. Usa `timeout` para que ningún comando se
+cuelgue si un topic no publica. **Mándame TODO lo que imprima** y con eso te digo qué falla.
+
+```bash
+export ROS_DOMAIN_ID=67
+echo "===== DOMAIN ====="                 ; echo "ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
+echo "===== NODOS VIVOS ====="             ; ros2 node list
+echo "===== TOPICS CLAVE ====="            ; ros2 topic list | grep -iE "scan|odom|cmd_vel|oakd|hazard|ir_|cliff|wheel|dock|battery"
+echo "===== QUIEN ESCUCHA /cmd_vel ====="  ; ros2 topic info /cmd_vel -v            | grep -iE "Type|Subscription count"
+echo "===== QUIEN ESCUCHA /cmd_vel_unstamped =====" ; ros2 topic info /cmd_vel_unstamped -v | grep -iE "Type|Subscription count"
+echo "===== LiDAR /scan (5s) ====="        ; timeout 5 ros2 topic hz /scan
+echo "===== /odom (1 msg) ====="           ; timeout 4 ros2 topic echo /odom --once | grep -A3 position
+echo "===== CAMARA (5s) ====="             ; timeout 5 ros2 topic hz /oakd/rgb/preview/image_raw
+echo "===== WHEELS (e-stop?) ====="        ; timeout 4 ros2 topic echo /wheel_status --once
+echo "===== DOCK ====="                    ; timeout 4 ros2 topic echo /dock_status --once | grep is_docked
+echo "===== HAZARD (bumper/cliff) ====="   ; timeout 4 ros2 topic echo /hazard_detection --once
+echo "===== BATERIA ====="                 ; timeout 4 ros2 topic echo /battery_state --once | grep -iE "percentage|voltage"
+echo "===== ¿corre la autonomia? ====="    ; pgrep -af autonomia_ || echo "NO esta corriendo"
+echo "===== ultimas 30 lineas del log =====" ; tail -n 30 ~/auto.log 2>/dev/null || echo "sin auto.log"
+echo "===== FIN DIAGNOSTICO ====="
+```
+
+**Prueba de MOVIMIENTO** (robot EN EL PISO, fuera del dock). Si esto NO mueve las ruedas, el
+problema es la base/`cmd_vel`, NO la lógica de navegación:
+```bash
+timeout 4 ros2 topic pub --rate 10 --qos-reliability best_effort /cmd_vel_unstamped geometry_msgs/msg/Twist "{linear: {x: 0.1}}"
+```
+
+### Cómo se lee esa salida (qué significa cada cosa)
+- **`/cmd_vel_unstamped` Subscription count = 1** (nodo `create3_repub`) → base OK → `USE_STAMPED=False` (lo actual).
+  Si **ambos** cmd_vel tienen 0 → la base NO escucha (¿Create3 en otro `ROS_DOMAIN_ID`? revisa su webserver `:8080`).
+- **`/scan` hz con números** → LiDAR vivo. Si dice "does not appear to be published" → LiDAR caído (relanzar bringup).
+- **`/odom` con `position`** → odometría viva (la memoria y los giros dependen de esto).
+- **CAMARA hz ~30** → cámara OK. Si nada → `ros2 service call /oakd/start_camera std_srvs/srv/Trigger`.
+- **`wheels_enabled: true`** → sin e-stop. Si `false` → hay e-stop puesto.
+- **`is_docked: false`** → fuera del dock. Si `true` → NO manejará; sácalo del dock.
+- **HAZARD vacío o solo `BACKUP_LIMIT`** → sin peligro. `WHEEL_DROP`/`CLIFF` → se cree levantado/al borde.
+- **BATERIA baja (<15%)** → puede negarse a moverse o ir lento.
+
+---
+
+## Ideas / pendientes (para no olvidarlas)
+- **Giro de 90° EXACTO por `/odom` (estado `TURN`):** el código existe (`_start_turn` + estado
+  `TURN` + config `KP_TURN`/`W_TURN_*`/`TURN_STEP_DEG`) pero **hoy NO está cableado**: las señales
+  `LEFT/RIGHT` van al **buffer** y se ejecutan como *rodeo* en EXPLORE, no como giro medido. Si el
+  rodeo no da giros limpios en esquinas de 90°, cablear `LEFT/RIGHT → self.turn_request` para usarlo.
+  (Se dejó en el código a propósito, como base lista para ese upgrade.)
+- **Medir latencia del YOLO** (cámara→laptop→comando→robot): próximo upgrade para saber el retardo
+  de reacción real y ajustar `--consec`/velocidad. (pendiente para pruebas de mañana)
+- **`SIGN_W`** quedó como config sin uso (la señal en bifurcación es prioridad dura, no un peso).
+- **Memoria topológica (Trémaux)** como alternativa si la rejilla por `odom` deriva demasiado.
 
 ---
 
