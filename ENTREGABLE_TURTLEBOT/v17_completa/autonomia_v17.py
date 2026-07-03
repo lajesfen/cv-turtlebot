@@ -6,6 +6,8 @@
 #       TIEMPO (SIGN_TTL) Y por DISTANCIA (SIGN_MAX_DIST) -> anti-fantasma, cubre el cooldown del YOLO;
 #       (c) PROBE_AFTER 3.0->1.5s (rescate rapido); (d) borra memoria al registrar cada checkpoint QR.
 #       Fallback: v14 (misma nav, sin memoria ni senales).
+# v17.3 (merge de la otra cuenta) = consciencia de cuerpo (ROBOT_PASS 0.43, SIDE_AVOID 0.38, K_SIDE 2.0,
+#       KD_HEADING 0.55, STICK_W 0.8, EVADE_T 0.8) + _check_stall (atasco por odom -> EVADE). USE_STAMPED=True.
 # v16 (corregido) = EXPLORE que se MUEVE + fixes: (a) bifurcacion en Y obedece la senal en DRIVE
 #       (>=2 huecos -> elige el lado de la senal); (b) EXPLORE decrece velocidad suave (no escalon);
 #       (c) repulsion en EXPLORE ensancha pero NO invierte el giro comprometido. STOP de senal usa SSTOP.
@@ -60,17 +62,22 @@ except Exception:
     HAS_HAZARD = False
 
 # ============================== CONFIG (m, rad/s, grados) =============================
-USE_STAMPED = False     # ESTE robot NO fue reflasheado: se mueve con Twist en /cmd_vel_unstamped
-                        # (lo escucha create3_repub, best_effort). /cmd_vel (TwistStamped) tiene 0
-                        # suscriptores en este robot -> NO mueve. Verificar: ros2 topic info /cmd_vel -v
+USE_STAMPED = False     # Publica Twist en /cmd_vel_unstamped -> lo escucha 'create3_repub' (puente
+                        #   directo a la base). Es la ruta MAS directa/robusta y la que definimos.
+                        # OJO: en el ultimo diagnostico AMBOS (/cmd_vel y /cmd_vel_unstamped) tenian 1
+                        #   suscriptor, asi que NO esta 100% confirmado. VERIFICAR con la prueba de
+                        #   movimiento (robot en el PISO, fuera del dock):
+                        #     ros2 topic pub --rate 10 --qos-reliability best_effort /cmd_vel_unstamped \
+                        #          geometry_msgs/msg/Twist "{linear: {x: 0.1}}"
+                        #   Si NO mueve, prueba /cmd_vel (TwistStamped) y pon USE_STAMPED = True.
 START_ARMED = False
 STAGE       = 1
 QR_LOG_FILE = "/home/ubuntu/checkpoints_log.txt"
 
 # --- Velocidades ---
 LIN    = 0.15            # (referencia v4)
-LIN_MAX = 0.26           # v14: techo un pelin menor (mas control). Sube/baja para mas/menos velocidad.
-W_ALIGN = 0.9            # v10: por encima de este giro, la velocidad cae a su piso
+LIN_MAX = 0.30           # finetune recta (antes 0.26). SOLO afecta DRIVE. Techo de velocidad; frenado por proximidad/giro sigue intacto.
+W_ALIGN = 1.2            # finetune recta (antes 0.9). Mas tolerante al giro de centrado -> no mata la velocidad en recta angosta.
 FLOOR_ALIGN = 0.25       # v10: fraccion minima de velocidad al girar fuerte
 W_MAX  = 1.2            # tope de giro en DRIVE.
 W_ROT  = 0.7            # giro de escape/exploracion.
@@ -88,7 +95,7 @@ D_EMERG = 0.20          # frente < esto (o ciego) = peligro -> NO avanza en EXPL
 
 # --- Hueco transitable ---
 D_CLEAR    = 0.55       # un rayo es "libre" si supera esto.
-ROBOT_PASS = 0.41       # v12: ancho minimo del hueco (diam 0.346 + ~3.2cm/lado). Modo normal.
+ROBOT_PASS = 0.43       # v17.3 merge: +consciencia de cuerpo (roza el lateral superior). Subir si roza; bajar si rechaza validos.
 ROBOT_PASS_MIN = 0.376  # v16: umbral RELAJADO en PROBE = ~1.5 cm/lado. Solo si esta atascado.
 PROBE_AFTER = 1.5       # v17.1: rescate rapido (antes 3.0s). NO forzamos avance contra la caja (choque=DQ); solo colamos por el hueco justo antes.
 PROBE_V    = 0.06       # velocidad LENTA al colarse por el hueco justo.
@@ -99,12 +106,16 @@ SAFETY       = 0.03     # 3cm de inflacion.
 R_INFL       = ROBOT_RADIUS + SAFETY
 SIDE_CENTER_DEG = 90.0  # sector lateral centrado en +-90.
 SIDE_HALF_DEG   = 55.0  # ancho del sector lateral.
-SIDE_AVOID      = 0.32  # esquiva el flanco un pelin antes.
-K_SIDE          = 1.5   # repulsion lateral (anti-roce).
+SIDE_AVOID      = 0.38  # v17.3 merge: se aleja mas de los flancos (anti-roce).
+K_SIDE          = 2.0   # v17.3 merge: repulsion lateral mas fuerte. Muy alto = zigzag.
 BACKUP_T   = 0.6        # seg de retroceso tras un golpe.
 BACKUP_V   = -0.10      # velocidad de retroceso (m/s).
-EVADE_T    = 0.5        # duracion de evasion tras GOLPE real.
+EVADE_T    = 0.8        # v17.3 merge: recuperacion mas larga tras golpe/ATASCO (retrocede+gira a hueco NUEVO).
 EVADE_COOLDOWN = 1.5    # seg sin re-disparar evasion.
+# --- ATASCO por odometria (v17.3 merge): independiente del bumper (que no reporta) ---
+STALL_T = 0.8           # seg comandando movimiento pero SIN trasladar NI rotar -> declara atasco -> EVADE.
+STALL_D = 0.02          # m: traslacion minima para considerar "avanzo".
+STALL_A = 0.10          # rad (~6 deg): rotacion minima para considerar "giro".
 FRONT_DEG       = -90.0 # CALIBRADO: caja al frente leyo ~-90 deg.
 FRONT_HALF_DEG  = 14.0  # medio cono frontal para decidir DRIVE/EXPLORE.
 SEARCH_HALF_DEG = 150.0 # busca huecos en +-150 deg.
@@ -112,12 +123,12 @@ R_MIN, R_MAX    = 0.06, 12.0
 
 # --- Control PD del rumbo en DRIVE (sin termino I) ---
 KP_HEADING = 1.1
-KD_HEADING = 0.40
+KD_HEADING = 0.55       # v17.3 merge: mas amortiguacion del giro (menos zigzag en recto).
 # Kalman 1D [theta, thetadot]
 KF_R = 0.0030
 KF_Q_TH = 0.0010
 KF_Q_THD = 0.0200
-STICK_W = 0.5           # histeresis al elegir hueco (pegajosidad al rumbo previo).
+STICK_W = 0.8           # v17.3 merge: mas pegajoso al rumbo previo (menos zigzag).
 
 # --- Giro de esquina por /odom ---
 TURN_STEP_DEG  = 90.0
@@ -141,6 +152,7 @@ SIGN_TTL          = 10.0   # una senal de giro en el buffer expira por TIEMPO (s
 SIGN_MAX_DIST     = 1.5    # v17.1: ...y por DISTANCIA (m): si avanzo mas de esto desde que la vi, se descarta (anti-fantasma / cubre el cooldown de 5s del YOLO).
 SIGN_TRIGGER_DIST = 0.55   # solo para 'stop': frena cuando el frente < esto (m).
 STOP_HOLD_S       = 2.0    # 'stop': frena este tiempo y sigue solo.
+META_HOLD_S       = 10.0   # META (linea de meta): parar este tiempo. PROVISIONAL -> CONFIRMAR con Rensso.
 
 # --- MEMORIA de trayectoria (v17): rejilla de 'migas de pan' en marco /odom, anti-loop ---
 USE_MEMORY    = True    # apaga (False) para comportarte EXACTO como v16.
@@ -190,6 +202,8 @@ class AutonomiaV17(Node):
         self.have_odom = False
         self.visit = {}                  # v17: {(i,j): conteo} celdas visitadas (marco odom)
         self._last_mark = 0.0
+        self.stall_px = 0.0; self.stall_py = 0.0; self.stall_yaw = 0.0   # v17.3: ref del detector de atasco
+        self.stall_t0 = 0.0
 
         self.state = "DRIVE"             # DRIVE | ROTATE(=EXPLORE) | TURN | PROBE | EVADE | SIGNSTOP
         self.rot_dir = -1.0              # direccion COMPROMETIDA al rodear (-1 der, +1 izq)
@@ -213,6 +227,9 @@ class AutonomiaV17(Node):
         self.sign_py = 0.0
         self.pending_stop = False     # senal YOLO 'stop' pendiente
         self.signstop_end = 0.0       # fin del frenado por 'stop'
+        self.pending_meta = False     # META detectada (comando UDP 'META')
+        self.meta_stop_end = 0.0      # fin del paro de 10s en la meta
+        self.meta_done = False        # ya se proceso la meta (no repetir)
         self.turn_mode = None
         self.target_yaw = 0.0
         self.turn_t_end = 0.0
@@ -227,6 +244,7 @@ class AutonomiaV17(Node):
         self.checkpoints = set()
         self.create_timer(1.0 / CONTROL_HZ, self.control_step)
 
+        self.cmd_count = 0            # DIAG: comandos UDP recibidos y parseados OK
         self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.cmd_sock.bind(("0.0.0.0", CMD_LISTEN_PORT))
         threading.Thread(target=self._cmd_listen, daemon=True).start()
@@ -292,10 +310,19 @@ class AutonomiaV17(Node):
         self._btn_prev = pressed
 
     def _cmd_listen(self):
+        # DIAG v17.2: protocolo opcional "CMD#seq". Si trae #seq, responde "ACK#seq" al emisor
+        #   (la laptop mide RTT y perdida). "PING#seq" -> "PONG#seq" SIN efecto en la nav.
+        #   cmd_count permite verificar parseo/coordinacion (cuantos comandos entraron de verdad).
         while True:
             try:
-                data, _ = self.cmd_sock.recvfrom(256)
-                c = data.decode(errors="ignore").strip().upper()
+                data, addr = self.cmd_sock.recvfrom(256)
+                raw = data.decode(errors="ignore").strip()
+                base, _, seq = raw.partition("#")        # "LEFT#42" -> base="LEFT", seq="42"
+                c = base.strip().upper()
+                if c == "PING":                          # DIAG puro: latencia/perdida sin mover el robot
+                    if seq:
+                        self.cmd_sock.sendto(f"PONG#{seq}".encode(), addr)
+                    continue
                 if c in ("ARM", "GO"):
                     self.armed = True; self.visit.clear(); self._enter("DRIVE")
                 elif c in ("PAUSE", "STOP", "IDLE"):
@@ -310,9 +337,14 @@ class AutonomiaV17(Node):
                     self.sign_px = self.px; self.sign_py = self.py
                 elif c in ("SSTOP", "SIGN_STOP"):
                     self.pending_stop = True                            # senal 'stop' (por cercania)
+                elif c in ("META", "FINISH"):
+                    self.pending_meta = True                            # llego a la meta (bandera a cuadros)
                 else:
                     continue
-                self.get_logger().info(f">>> CMD laptop: {c}")
+                self.cmd_count += 1                       # DIAG: contador de comandos validos
+                if seq:                                   # DIAG: confirma recepcion a la laptop (RTT/perdida)
+                    self.cmd_sock.sendto(f"ACK#{seq}".encode(), addr)
+                self.get_logger().info(f">>> CMD #{self.cmd_count} '{c}' seq={seq or '-'} de {addr[0]}")
             except Exception as e:
                 self.get_logger().error(f"cmd_listen: {e}")
                 break
@@ -548,6 +580,21 @@ class AutonomiaV17(Node):
                                f"{abs(math.degrees(delta)):.0f}deg ({self.turn_mode})")
 
     # ------------------------------- Decision -------------------------------
+    def _check_stall(self):
+        # ATASCO (v17.3 merge): comando movimiento pero NO me traslado NI roto por STALL_T seg.
+        # Independiente del bumper (que en este robot no reporta). Dispara EVADE hacia un hueco NUEVO.
+        if not self.have_odom:
+            return False
+        now = time.time()
+        moved = (math.hypot(self.px - self.stall_px, self.py - self.stall_py) > STALL_D or
+                 abs(wrap(self.yaw - self.stall_yaw)) > STALL_A)
+        cmd_move = (abs(self.v_cur) > 0.02 or abs(self.w_cur) > 0.15)   # estamos PIDIENDO movernos
+        if moved or not cmd_move:
+            self.stall_px, self.stall_py, self.stall_yaw = self.px, self.py, self.yaw
+            self.stall_t0 = now
+            return False
+        return (now - self.stall_t0) > STALL_T
+
     def decide(self, scan, dt):
         self._mark_visit()   # v17: deja miga de la celda actual (throttled)
         # SIGNSTOP: 'stop' de senal -> frena STOP_HOLD_S y sigue solo.
@@ -556,6 +603,24 @@ class AutonomiaV17(Node):
             if now0 < self.signstop_end:
                 return 0.0, 0.0
             self._enter("DRIVE")
+
+        # META (bandera a cuadros): PROVISIONAL. **CONFIRMAR CON RENSSO**: ¿el intento TERMINA en la meta
+        # (detener y ya) o hay que seguir? Por ahora: PARAR META_HOLD_S seg y girar 180 para no quedar
+        # mirando la meta y re-disparar. meta_done evita repetirlo. Si Rensso dice "terminar", en METASTOP
+        # deja return 0,0 permanente (no dispares el giro).
+        if self.state == "METASTOP":
+            if now0 < self.meta_stop_end:
+                return 0.0, 0.0
+            self.turn_request = math.pi        # 180 grados por /odom (lo ejecuta el estado TURN)
+            self.meta_done = True
+            self._enter("DRIVE")
+            return 0.0, 0.0
+        if self.pending_meta and not self.meta_done and self.state not in ("TURN", "METASTOP", "SIGNSTOP"):
+            self.pending_meta = False
+            self.meta_stop_end = now0 + META_HOLD_S
+            self._enter("METASTOP")
+            self.get_logger().info(">>> META: PARO 10s y luego giro 180. (CONFIRMAR con Rensso si el intento termina aqui)")
+            return 0.0, 0.0
 
         # 'stop' de senal: al acercarse a la pared, frena STOP_HOLD_S y sigue solo.
         if self.state not in ("TURN", "SIGNSTOP") and self.pending_stop:
@@ -586,17 +651,19 @@ class AutonomiaV17(Node):
 
         # EVADE solo ante GOLPE REAL (no por proximidad LiDAR -> NO titubea en curvas).
         now = time.time()
-        if self.bump_flag and self.state != "EVADE" and (now - self.t_evade_end) > EVADE_COOLDOWN:
+        stalled = self._check_stall()                  # v17.3: atasco por odom (el bumper no reporta)
+        if (self.bump_flag or stalled) and self.state != "EVADE" and (now - self.t_evade_end) > EVADE_COOLDOWN:
             self.bump_flag = False
-            if self.bump_side != 0.0:
-                self.evade_dir = -self.bump_side
+            if self.bump_side != 0.0 and not stalled:
+                self.evade_dir = -self.bump_side       # golpe con lado conocido -> evade al opuesto
             else:
                 li = self.sector_min(scan,  math.radians(60.0), math.radians(40.0))
                 ri = self.sector_min(scan, -math.radians(60.0), math.radians(40.0))
-                self.evade_dir = 1.0 if li >= ri else -1.0
+                self.evade_dir = 1.0 if li >= ri else -1.0   # atasco/centro -> gira al lado MAS abierto (hueco NUEVO)
+            self.stall_t0 = now                        # reinicia el reloj de atasco
             self.t_evade = now
             self._enter("EVADE")
-            self.get_logger().info(f"[EVADE] golpe -> gira {'IZQ' if self.evade_dir>0 else 'DER'}")
+            self.get_logger().info(f"[EVADE] {'ATASCO' if stalled else 'golpe'} -> gira {'IZQ' if self.evade_dir>0 else 'DER'}")
         else:
             self.bump_flag = False
         if self.state == "EVADE":

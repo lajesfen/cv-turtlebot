@@ -26,7 +26,11 @@ nano ~/autonomia_v17.py      # edita la línea 63: USE_STAMPED = False  <->  Tru
 
 **Cómo saber cuál va (en el robot, 15 s):**
 ```bash
-ros2 topic info /cmd_vel -v            # mira "Subscription count"
+ros2 toexport ROS_DOMAIN_ID=67
+pkill -f autonomia_ ; pkill -f ver_y_capturar ; pkill -f teleop ; sleep 2
+ros2 service call /oakd/start_camera std_srvs/srv/Trigger
+nohup python3 ~/autonomia_v14.py > ~/auto.log 2>&1 &
+tail -f ~/auto.logpic info /cmd_vel -v            # mira "Subscription count"
 ros2 topic info /cmd_vel_unstamped -v
 ```
 - `/cmd_vel_unstamped` con 1 suscriptor (`create3_repub`) → `USE_STAMPED = False` (lo actual, correcto).
