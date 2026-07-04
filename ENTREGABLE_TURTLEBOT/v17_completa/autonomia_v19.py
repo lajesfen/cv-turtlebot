@@ -172,11 +172,11 @@ STOP_COOLDOWN     = 5.0    # v17.7: tras un STOP, IGNORA nuevos SSTOP por este t
 META_HOLD_S       = 10.0   # META (linea de meta): parar este tiempo. PROVISIONAL -> CONFIRMAR con Rensso.
 
 # --- MEMORIA de trayectoria (v17): rejilla de 'migas de pan' en marco /odom, anti-loop ---
-USE_MEMORY    = False   # v18: APAGADA para probar (era True). Toggle LIMPIO: off=efecto cero, no rompe. Pon True para anti-loop.
+USE_MEMORY    = True    # v19: RE-ACTIVADA -> premia huecos NUEVOS (evita volver por donde vino). Toggle limpio.
 MEM_CELL      = 0.35    # v17.7: celda mas grande (antes 0.25) = memoria mas robusta a la deriva del odom. Mas chico = mas fina pero sensible a la
                         #   deriva del odom. ~= radio del robot es un buen punto medio.
 MEM_LOOKAHEAD = 0.60    # a que distancia adelante (m) miro la celda para juzgar un rumbo candidato.
-W_VISIT       = 0.30    # v17.12: memoria mas SUAVE (antes 0.60) -> en bifurcaciones ya visitadas NO se traba; sigue eligiendo el mejor hueco.
+W_VISIT       = 0.40    # v19: peso anti-retroceso (0.30->0.40). Sube si aun vuelve por donde vino; baja si duda de mas.
 MEM_MARK_HZ   = 4.0     # cada cuanto dejo una miga (Hz). No hace falta a 20 Hz.
 MEM_CAP       = 8       # tope de conteo por celda (para que una celda muy pisada no domine todo).
 # =====================================================================================
