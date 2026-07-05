@@ -170,13 +170,16 @@ SIGN_ALIGN_MARGIN = 45 # v19: un hueco 'cuenta' para la senal si NO es del lado 
 STOP_HOLD_S       = 2.0    # 'stop': frena este tiempo y sigue solo.
 STOP_COOLDOWN     = 5.0    # v17.7: tras un STOP, IGNORA nuevos SSTOP por este tiempo (no re-frena con el mismo stop a la vista).
 META_HOLD_S       = 10.0   # META (linea de meta): parar este tiempo. PROVISIONAL -> CONFIRMAR con Rensso.
+META_TRIGGER_DIST = 0.30   # v19.8: tras detectar META, NO frena de golpe -> sigue navegando y SOLO lanza el paro
+                           #   de 10s cuando el frente < esto (mismo patron que el 'stop'). Sube si frena tarde/pronto.
 
 # --- MEMORIA de trayectoria (v17): rejilla de 'migas de pan' en marco /odom, anti-loop ---
-USE_MEMORY    = False   # v18: APAGADA para probar (era True). Toggle LIMPIO: off=efecto cero, no rompe. Pon True para anti-loop.
+USE_MEMORY    = False    # v19: RE-ACTIVADA -> premia huecos NUEVOS (evita volver por donde vino). Toggle limpio.
 MEM_CELL      = 0.35    # v17.7: celda mas grande (antes 0.25) = memoria mas robusta a la deriva del odom. Mas chico = mas fina pero sensible a la
                         #   deriva del odom. ~= radio del robot es un buen punto medio.
 MEM_LOOKAHEAD = 0.60    # a que distancia adelante (m) miro la celda para juzgar un rumbo candidato.
-W_VISIT       = 0.30    # v17.12: memoria mas SUAVE (antes 0.60) -> en bifurcaciones ya visitadas NO se traba; sigue eligiendo el mejor hueco.
+W_VISIT       = 0.55    # v19: peso anti-retroceso. Con el TOPE de abajo da igual pasarse un poco.
+VISIT_PEN_MAX = 1.0     # v19.5: TOPE de la penalizacion de memoria (bajado de 1.5). Empujon gentil, nunca protagonista.
 MEM_MARK_HZ   = 4.0     # cada cuanto dejo una miga (Hz). No hace falta a 20 Hz.
 MEM_CAP       = 8       # tope de conteo por celda (para que una celda muy pisada no domine todo).
 # =====================================================================================
@@ -219,6 +222,7 @@ class AutonomiaV19(Node):
         self.have_odom = False
         self.visit = {}                  # v17: {(i,j): conteo} celdas visitadas (marco odom)
         self._last_mark = 0.0
+        self._last_memlog = 0.0       # v19.2: throttle del log de diagnostico de memoria
         self.stall_px = 0.0; self.stall_py = 0.0; self.stall_yaw = 0.0   # v17.3: ref del detector de atasco
         self.stall_t0 = 0.0
 
@@ -277,7 +281,7 @@ class AutonomiaV19(Node):
         self.cmd_sock.bind(("0.0.0.0", CMD_LISTEN_PORT))
         threading.Thread(target=self._cmd_listen, daemon=True).start()
 
-        self.get_logger().info("=== autonomia_v19 (v18 + senal busca su lado aunque de la vuelta + anti-roce cuarto-frontal) ===")
+        self.get_logger().info("=== autonomia_v19.8 (META frena por proximidad como el stop; senal en bifurcacion) ===")
         self.get_logger().info(f"Estado inicial: {'ARMADO' if self.armed else 'IDLE'} | boton1 o tecla g.")
 
     # ------------------------------- Callbacks -------------------------------
@@ -448,15 +452,20 @@ class AutonomiaV19(Node):
         c = self._cell(self.px, self.py)
         self.visit[c] = min(self.visit.get(c, 0) + 1, MEM_CAP)
 
-    def _visit_ahead(self, centro):
-        # conteo de visitas de la celda ~MEM_LOOKAHEAD m adelante, en el rumbo relativo 'centro'.
-        # Es el "ya estuve por alla?" que se suma al costo del hueco. 0 si no hay odom.
+    def _visit_ahead(self, centro, reach=1.2):
+        # v19.5: suma de visitas en puntos del rumbo PERO solo hasta 'reach' = profundidad DESPEJADA del hueco.
+        #   Asi NO cuenta celdas DETRAS de un obstaculo (inalcanzables por ese rumbo) -> se acaban las
+        #   penalizaciones FANTASMA que hacian dudar/bucle. 0 si no hay odom. Costo SUAVE.
         if not (USE_MEMORY and self.have_odom):
             return 0.0
-        wh = self.yaw + centro                       # rumbo en el mundo (odom)
-        wx = self.px + MEM_LOOKAHEAD * math.cos(wh)
-        wy = self.py + MEM_LOOKAHEAD * math.sin(wh)
-        return float(self.visit.get(self._cell(wx, wy), 0))
+        tot = 0.0
+        for d in (0.4, 0.8, 1.2):
+            if d > reach:        # no mirar mas alla de donde el hueco esta despejado
+                break
+            wx = self.px + d * math.cos(self.yaw + centro)
+            wy = self.py + d * math.sin(self.yaw + centro)
+            tot += self.visit.get(self._cell(wx, wy), 0)
+        return float(tot)
 
     def _door_ok(self, pts, i, j, n, thr):
         # v18: PUERTA real = distancia (m) entre los DOS obstaculos que bordean el arco libre (indices i-1, j+1).
@@ -509,7 +518,7 @@ class AutonomiaV19(Node):
                     costo = abs(centro) - (0.08 if centro > 0 else 0.0)
                     if use_stick:
                         costo += STICK_W * abs(wrap(centro - self.prev_heading))
-                    costo += W_VISIT * self._visit_ahead(centro)   # v17: evita volver a lo ya recorrido
+                    costo += min(W_VISIT * self._visit_ahead(centro, dmin), VISIT_PEN_MAX)   # v19.5: solo cuenta lo ALCANZABLE (hasta dmin); TOPADO
                     if mejor is None or costo < mejor[0]:
                         mejor = (costo, centro, dmin)
                 i = j + 1
@@ -642,6 +651,9 @@ class AutonomiaV19(Node):
 
     def decide(self, scan, dt):
         self._mark_visit()   # v17: deja miga de la celda actual (throttled)
+        if USE_MEMORY and (now0_ml := time.time()) - self._last_memlog > 1.0:   # v19.2 DIAG memoria
+            self._last_memlog = now0_ml
+            self.get_logger().info(f"[MEM] celdas={len(self.visit)} odom={self.have_odom} pos=({self.px:.2f},{self.py:.2f})")
         # SIGNSTOP: 'stop' de senal -> frena STOP_HOLD_S y sigue solo.
         now0 = time.time()
         if self.state == "SIGNSTOP":
@@ -662,19 +674,22 @@ class AutonomiaV19(Node):
             self._enter("DRIVE")
             return 0.0, 0.0
         if self.pending_meta and not self.meta_done and self.state not in ("TURN", "METASTOP", "SIGNSTOP"):
-            self.pending_meta = False
-            self.meta_stop_end = now0 + META_HOLD_S
-            self._enter("METASTOP")
-            total = (time.time() - self.t_armed) if self.t_armed else -1.0   # v17.7: resumen de checkpoints al llegar a META
-            try:
-                with open(QR_LOG_FILE, "a", encoding="utf-8") as f:
-                    f.write(f"===== META (STAGE {STAGE}) | tiempo total +{total:.1f}s | {len(self.checkpoints)}/3 checkpoints =====\n")
-                    for l in self.cp_times:
-                        f.write("   " + l + "\n")
-            except Exception:
-                pass
-            self.get_logger().info(f">>> META: {len(self.checkpoints)}/3 checkpoints en +{total:.1f}s. PARO 10s + giro 180 (CONFIRMAR con Rensso).")
-            return 0.0, 0.0
+            fr_meta = self.sector_min(scan, 0.0, math.radians(FRONT_HALF_DEG))   # v19.8: distancia al frente AHORA
+            if fr_meta < META_TRIGGER_DIST:                                      # SOLO aqui frena: ya llego a la meta
+                self.pending_meta = False
+                self.meta_stop_end = now0 + META_HOLD_S
+                self._enter("METASTOP")
+                total = (time.time() - self.t_armed) if self.t_armed else -1.0   # v17.7: resumen de checkpoints al llegar a META
+                try:
+                    with open(QR_LOG_FILE, "a", encoding="utf-8") as f:
+                        f.write(f"===== META (STAGE {STAGE}) | tiempo total +{total:.1f}s | {len(self.checkpoints)}/3 checkpoints =====\n")
+                        for l in self.cp_times:
+                            f.write("   " + l + "\n")
+                except Exception:
+                    pass
+                self.get_logger().info(f">>> META a {fr_meta:.2f}m: {len(self.checkpoints)}/3 checkpoints en +{total:.1f}s. PARO 10s + giro 180 (CONFIRMAR con Rensso).")
+                return 0.0, 0.0
+            # v19.8: META detectada pero AUN LEJOS (frente >= META_TRIGGER_DIST) -> sigue navegando normal, NO frena todavia.
 
         # v17.7: durante el cooldown, ignora cualquier SSTOP (evita re-frenar con el mismo stop a la vista).
         if now0 <= self.stop_cd_end:
@@ -709,7 +724,7 @@ class AutonomiaV19(Node):
         # EVADE FINO (revert v17.11): giro CORTO fijo. Ante GOLPE real, o ATASCO por odom SOLO en DRIVE
         # (NO interrumpe el enhebrado fino de PROBE/EXPLORE). Restaura el control delicado de v17.
         now = time.time()
-        stalled = self._check_stall() and self.state == "DRIVE"   # el atasco solo cuenta en DRIVE
+        stalled = self._check_stall() and self.state in ("DRIVE", "PROBE")   # v19.1: recupera tambien en PROBE si de verdad se atasca (0 avance)
         if (self.bump_flag or stalled) and self.state != "EVADE" and (now - self.t_evade_end) > EVADE_COOLDOWN:
             self.bump_flag = False
             if self.bump_side != 0.0 and not stalled:
@@ -781,7 +796,17 @@ class AutonomiaV19(Node):
                 self.kf_reset(rumbo_z)
             else:
                 theta_f, thetadot_f = self.kf_step(rumbo_z, dt)
-            w = clamp(KP_HEADING * theta_f + KD_HEADING * thetadot_f, -W_MAX, W_MAX)
+            # v19.1: PROBE con ANTI-ROCE (antes NO tenia repulsion -> clavaba la esquina de ~90). Lateral + cuarto-frontal.
+            lft = self.sector_min(scan,  math.radians(SIDE_CENTER_DEG), math.radians(SIDE_HALF_DEG))
+            rgt = self.sector_min(scan, -math.radians(SIDE_CENTER_DEG), math.radians(SIDE_HALF_DEG))
+            fl2 = self.sector_min(scan,  math.radians(FRONT_Q_DEG), math.radians(FRONT_Q_HALF))
+            fr2 = self.sector_min(scan, -math.radians(FRONT_Q_DEG), math.radians(FRONT_Q_HALF))
+            rep = 0.0
+            if lft < SIDE_AVOID: rep -= K_SIDE * (SIDE_AVOID - lft)
+            if rgt < SIDE_AVOID: rep += K_SIDE * (SIDE_AVOID - rgt)
+            if fl2 < FRONT_AVOID: rep -= K_FRONT * (FRONT_AVOID - fl2)
+            if fr2 < FRONT_AVOID: rep += K_FRONT * (FRONT_AVOID - fr2)
+            w = clamp(KP_HEADING * theta_f + KD_HEADING * thetadot_f + rep, -W_MAX, W_MAX)
             clear_dir = self.sector_min(scan, theta_f, math.radians(FRONT_HALF_DEG))
             if clear_dir > D_FREE and abs(theta_f) < math.radians(12):
                 self._enter("DRIVE")
@@ -795,28 +820,25 @@ class AutonomiaV19(Node):
             self._enter_rotate(scan)
             return EXPLORE_V, self.rot_dir * W_ROT
         h = None
-        if self._sign_fresh():                            # obedece la senal
-            lado = 1.0 if self.sign_dir > 0 else -1.0     # +1 izq (centro>0), -1 der (centro<0)
-            if SIGN_INVERT: lado = -lado
-            fwd = [g for g in gaps if abs(g[0]) <= math.radians(FWD_CONE_DEG)]   # solo hacia ADELANTE (no 180)
-            m = math.radians(SIGN_ALIGN_MARGIN)
-            if lado < 0:                                  # DERECHA: descarta lo claramente-izquierda (centro > +m)
-                good = [g for g in fwd if g[0] <= m]
-                h = min(good, key=lambda g: g[0]) if good else None    # el MAS a la derecha entre los de adelante
-            else:                                         # IZQUIERDA: descarta lo claramente-derecha
-                good = [g for g in fwd if g[0] >= -m]
-                h = max(good, key=lambda g: g[0]) if good else None    # el MAS a la izquierda
-            if h is not None:
-                self.get_logger().info(f">>> SENAL {'IZQ' if lado>0 else 'DER'} -> hueco mas a ese lado (adelante), centro={math.degrees(h[0]):.0f} deg")
+        # v19.7: la flecha se obedece en DRIVE SOLO si hay BIFURCACION real (>=2 huecos que caben) -> elige
+        #   el hueco del LADO de la senal. Es la logica v16/v17 que "antes funcionaba"; v19.6 la habia
+        #   quitado de mas (por eso dejo de hacer caso al YOLO en las Y). Casos:
+        #     - 1 hueco  (pasillo recto): NO obedece -> geometria pura (no gira "desde lejos"). <- lo pedido
+        #     - 0 huecos (pared al frente): lo resuelve _enter_rotate de arriba (ahi consulta la senal).
+        #     - >=2 huecos (Y): obedece la flecha -> hueco extremo hacia ese lado, mirando ADELANTE.
+        if len(gaps) >= 2 and self._sign_fresh():
+            sign = self.sign_dir
+            if SIGN_INVERT: sign = -sign
+            fwd = [g for g in gaps if abs(g[0]) <= math.radians(FWD_CONE_DEG)]   # descarta huecos ~180 (atras)
+            cand = fwd if fwd else gaps
+            if sign > 0:
+                h = max(cand, key=lambda g: g[0])        # senal IZQ -> el hueco MAS a la izquierda
             else:
-                # v19: NO hay via del lado de la senal hacia adelante (solo del lado contrario) -> NO ir al contrario;
-                #   GIRA comprometido hacia el lado de la senal a BUSCAR via (puede dar la vuelta), como pediria el profe.
-                self.rot_dir = -1.0 if lado < 0 else 1.0
-                self._enter("ROTATE")
-                self.get_logger().info(f">>> SENAL {'IZQ' if lado>0 else 'DER'} sin via adelante -> giro a buscar ese lado (puede dar la vuelta)")
-                return EXPLORE_V, self.rot_dir * W_ROT
+                h = min(cand, key=lambda g: g[0])        # senal DER -> el hueco MAS a la derecha
+            self.get_logger().info(f">>> SENAL {'IZQ' if sign>0 else 'DER'} en bifurcacion ({len(gaps)} huecos) "
+                                   f"-> hueco centro={math.degrees(h[0]):.0f} deg")
         if h is None:
-            h = self.mejor_hueco(scan, use_stick=True)
+            h = self.mejor_hueco(scan, use_stick=True)   # sin senal fresca / recto -> geometria pura
             if h is None:
                 self._enter_rotate(scan)
                 return EXPLORE_V, self.rot_dir * W_ROT
